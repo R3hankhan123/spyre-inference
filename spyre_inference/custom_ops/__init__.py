@@ -21,4 +21,3 @@ def register_all():
     rotary_embedding.register()
     rms_norm.register()
     silu_and_mul.register()
-    linear.register()
