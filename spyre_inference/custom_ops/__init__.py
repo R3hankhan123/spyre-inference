@@ -18,4 +18,3 @@ def register_all():
     parallel_lm_head.register()
     rotary_embedding.register()
     rms_norm.register()
-    linear.register()
