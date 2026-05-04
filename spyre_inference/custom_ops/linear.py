@@ -72,18 +72,13 @@ class SpyreLinearBase:
         Returns:
             Output tensor on original device with original dtype
         """
-        x_dtype = x.dtype
-        x_device = x.device
 
         # Bias is fused into F.linear only when not skipping bias add
         bias = self.bias.data if (self.bias is not None and not self.skip_bias_add) else None
 
-        # Convert input to Spyre device/dtype
-        # Weights and bias are already on Spyre which is moved by model runner
-        x_spyre = convert(x, self._target_device, self._target_dtype)
-
-        out = F.linear(x_spyre, self.weight.data, bias)
-        return convert(out, dtype=x_dtype, device=x_device)
+        out = F.linear(x, self.weight.data, bias)
+        
+        return out
 
     def _forward_with_bias(
         self, _input: torch.Tensor
@@ -159,8 +154,6 @@ class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
         Returns:
             Tuple of (output, bias) if return_bias=True, else just output.
         """
-        output = self._forward_impl(input_)
-        # Keep output on Spyre — needed for residual add with Spyre hidden_states
-        output = convert(output, device=self._target_device, dtype=self._target_dtype)
+        output = self._forward_impl(convert(input_, device=self.weight.device))
 
         return self._forward_with_bias(output)
