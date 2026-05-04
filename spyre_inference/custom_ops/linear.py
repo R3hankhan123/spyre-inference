@@ -44,7 +44,7 @@ logger = init_logger(__name__)
 class SpyreLinearBase:
     """Shared implementation for Spyre linear layers at TP=1."""
 
-    def _init_spyre_linear(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         """Common initialization for Spyre linear layers."""
         super().__init__(*args, **kwargs)
         if self.tp_size > 1:
@@ -89,7 +89,7 @@ class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinea
     """Spyre MergedColumnParallelLinear (TP=1 only)."""
 
     def __init__(self, *args, **kwargs):
-        self._init_spyre_linear(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def forward(self, input_: torch.Tensor):
         """Forward pass for PluggableLayer.
@@ -107,7 +107,7 @@ class SpyreQKVParallelLinear(SpyreLinearBase, QKVParallelLinear):
     """Spyre QKVParallelLinear (TP=1 only)."""
 
     def __init__(self, *args, **kwargs):
-        self._init_spyre_linear(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def forward(self, input_: torch.Tensor):
         """Forward pass for PluggableLayer.
@@ -134,7 +134,7 @@ class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
     """Spyre RowParallelLinear (TP=1 only)."""
 
     def __init__(self, *args, **kwargs):
-        self._init_spyre_linear(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def forward(self, input_: torch.Tensor):
         """Forward pass for PluggableLayer.
