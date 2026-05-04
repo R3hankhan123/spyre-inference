@@ -76,23 +76,12 @@ class SpyreLinearBase:
         # Bias is fused into F.linear only when not skipping bias add
         bias = self.bias.data if (self.bias is not None and not self.skip_bias_add) else None
 
-        out = F.linear(x, self.weight.data, bias)
+        output = F.linear(x, self.weight.data, bias)
         
-        return out
-
-    def _forward_with_bias(
-        self, _input: torch.Tensor
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        """Common forward logic with optional bias output.
-        Args:
-            _input: Input tensor
-        Returns:
-            If return_bias=True, returns (output, bias) tuple; else just output tensor.
-        """
         if not self.return_bias:
-            return _input
+            return output
         output_bias = self.bias if self.skip_bias_add else None
-        return _input, output_bias
+        return output, output_bias
 
 
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
@@ -110,9 +99,7 @@ class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinea
         Returns:
             Tuple of (output, bias) if return_bias=True, else just output
         """
-        output = self._forward_impl(input_)
-
-        return self._forward_with_bias(output)
+        return self._forward_impl(input_)
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
@@ -131,11 +118,15 @@ class SpyreQKVParallelLinear(SpyreLinearBase, QKVParallelLinear):
         Returns:
             Tuple of (output, bias) if return_bias=True, else just output.
         """
-        output = self._forward_impl(input_)
-        # D2H before downstream .split() — Spyre can't handle strided views
-        output = convert(output, device="cpu")
-
-        return self._forward_with_bias(output)
+        output_output_bias = self._forward_impl(input_)
+        
+        # D2H the output before downstream .split() — Spyre can't handle strided views
+        if self.return_bias:
+            output = convert(output_output_bias[0], device="cpu")
+            return output, output_output_bias[1]
+        else:
+            output = convert(output, device="cpu")
+            return output
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
@@ -154,6 +145,4 @@ class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
         Returns:
             Tuple of (output, bias) if return_bias=True, else just output.
         """
-        output = self._forward_impl(convert(input_, device=self.weight.device))
-
-        return self._forward_with_bias(output)
+        return self._forward_impl(convert(input_, device=self.weight.device))
