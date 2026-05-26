@@ -41,6 +41,7 @@ References:
 
 import torch.nn.functional as F
 
+
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -66,7 +67,9 @@ class SpyreUnquantizedLinearMethod(UnquantizedLinearMethod):
     """
 
     def apply(self, layer, x, bias=None):
-        return F.linear(x, layer.weight.data, bias)
+        out = F.linear(x, layer.weight.data, bias)
+        tensor = convert(convert(out, device="cpu"), device="spyre")
+        return tensor
 
     def process_weights_after_loading(self, layer):
         pass

@@ -158,6 +158,20 @@ class _SpyreModelWrapper:
 
         return tree_map(_to_cpu, result)
 
+    def embed_input_ids(self, input_ids, **kwargs):
+        """Convert input_ids to spyre and output embeddings back to CPU.
+
+        gpu_model_runner._preprocess() calls embed_input_ids() directly
+        (bypassing __call__), so we need the same device conversion here.
+        """
+        input_ids_spyre = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        result = self._model.embed_input_ids(input_ids_spyre, **kwargs)
+
+        def _to_cpu(x):
+            return convert(x, device="cpu")
+
+        return tree_map(_to_cpu, result)
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 
@@ -249,6 +263,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
 
+        # Monkey patch Llama-4 attention scaling BEFORE compilation
+        # (torch-spyre doesn't support int64->float32 conversion).
+        # Must patch before torch.compile wraps the model, otherwise
+        # named_modules() won't traverse correctly.
+        self._patch_llama4_scaling()
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
@@ -298,6 +318,50 @@ class TorchSpyreModelRunner(GPUModelRunner):
             dynamic=False,
         )
         logger.info("Model compiled for Spyre (backend=inductor)")
+
+    def _patch_llama4_scaling(self) -> None:
+        """Monkey patch Llama-4 attention scaling to run on CPU.
+
+        torch-spyre inductor doesn't support int64->float32 dtype conversion.
+        The division operator in Llama-4 scaling (positions / max_pos) triggers
+        this conversion. Workaround: compute scaling on CPU, move result to Spyre.
+        """
+        logger.info("Searching for MistralAttention layers with Llama-4 scaling...")
+        logger.debug("Model type: %s", type(self.model).__name__)
+
+        patched_count = 0
+        # Find all MistralAttention layers that use Llama-4 scaling
+        for name, module in self.model.named_modules():
+            if hasattr(module, "do_llama_4_scaling") and module.do_llama_4_scaling:
+                original_method = module._get_llama_4_attn_scale
+
+                def make_cpu_scaling_method(orig_method, layer_module):
+                    @torch.compiler.disable
+                    def _get_llama_4_attn_scale_cpu(positions: torch.Tensor) -> torch.Tensor:
+                        positions_cpu = convert(positions, device="cpu")
+                        scaling = 1 + layer_module.llama_4_scaling_beta * torch.log(
+                            1
+                            + torch.floor(
+                                positions_cpu
+                                / layer_module.llama_4_scaling_original_max_position_embeddings
+                            )
+                        )
+
+                        # Broadcast over head_dim (return on CPU as float32)
+                        return scaling.unsqueeze(-1)
+
+                    return _get_llama_4_attn_scale_cpu
+
+                # Replace the method with CPU version
+                module._get_llama_4_attn_scale = make_cpu_scaling_method(original_method, module)
+                patched_count += 1
+
+        if patched_count > 0:
+            logger.info("✓ Patched %d MistralAttention layers for Llama-4 scaling", patched_count)
+        else:
+            logger.warning(
+                "⚠ No MistralAttention layers with Llama-4 scaling found - scaling will run with float division"
+            )
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up the model.

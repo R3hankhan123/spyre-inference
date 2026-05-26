@@ -14,18 +14,15 @@
 
 """Spyre OOT replacement for ParallelLMHead.
 
-Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
+Executes the lm_head matmul (hidden_states @ weight.T) on Spyre using
+chunked computation to avoid hardware limits.
 
 Architecture:
     - OOT Registration: @ParallelLMHead.register_oot() replaces upstream
       at instantiation
-    - forward_oot(): Entry point for OOT dispatch, handles device conversion
-      and runs the compiled F.linear on Spyre
-    - Separate Compilation: forward_spyre is compiled independently via
-      maybe_compile (no opaque custom-op boundary)
-    - quant_method override: SpyreUnquantizedLMHeadMethod.apply() calls
-      forward_oot() so that LogitsProcessor._get_logits() routes through
-      the Spyre path
+    - forward_oot(): Entry point for OOT dispatch, calls chunk.py helpers
+    - quant_method override: SpyreUnquantizedLMHeadMethod.apply() routes
+      through forward_oot() so LogitsProcessor uses the Spyre path
 
 Spyre Device Constraints:
     - No Tensor Parallelism (TP) support: tp_size > 1 raises NotImplementedError
@@ -34,10 +31,12 @@ Spyre Device Constraints:
 References:
     - Upstream ParallelLMHead:
       vllm/model_executor/layers/vocab_parallel_embedding.py
+    - Chunking logic: spyre_inference/custom_ops/chunk.py
 """
 
+from __future__ import annotations
+
 import torch
-import torch.nn.functional as F
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -45,41 +44,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .utils import convert
+from .chunk import forward_lm_head_oot, setup_lm_head_padding
 
 logger = init_logger(__name__)
 
 
 class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
-    """Routes lm_head computation through SpyreParallelLMHead.forward_oot()."""
+    """Routes ParallelLMHead logits through layer.forward_oot()."""
 
     def apply(self, layer, x, bias=None):
         return layer.forward_oot(x, bias)
 
     def process_weights_after_loading(self, layer):
         super().process_weights_after_loading(layer)
-
-        # torch-spyre currently has a limitation with the work division of larger
-        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
-        # an integer.
-        layer.padding = 0
-        pad_1 = layer.weight.shape[0] % 64
-        if pad_1 != 0:
-            raise ValueError("The weight dimension must be a multiple of 64.")
-        pad_2 = (layer.weight.shape[0] // 64) % 32
-        if pad_2 > 0:
-            pad_2 = 32 - pad_2
-            layer.padding = pad_2 * 64
-            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, layer.padding))
-            logger.warning_once(
-                "%s: weights padded from %d to %d (torch-spyre limitation) "
-                "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__,
-                layer.weight.shape[0],
-                layer.padded_weight.shape[0],
-            )
-        else:
-            layer.padded_weight = layer.weight
+        setup_lm_head_padding(layer)
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -113,18 +91,13 @@ class SpyreParallelLMHead(ParallelLMHead):
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-    def _apply(self, fn, recurse=True):
-        super()._apply(fn, recurse=recurse)
-        self.padded_weight = fn(self.padded_weight)
-        return self
-
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """OOT forward pass — lm_head matmul on Spyre.
 
         Called by SpyreUnquantizedLMHeadMethod.apply() from within
         LogitsProcessor._get_logits(). Converts x (arriving on cpu)
-        to the weight device (residing on spyre), runs the compiled F.linear on spyre
-        and converts back to the x device (cpu).
+        to the weight device (residing on spyre), and runs chunked F.linear
+        via forward_lm_head_oot.
 
         Args:
             x: Hidden states tensor [num_tokens, hidden_dim]
@@ -133,19 +106,4 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, vocab_size] on the input device
         """
-        x_device = x.device
-
-        # Due to indexing operations inside the ModelRunner, which have
-        # to be carried out on cpu due to a torch-spyre limitation,
-        # the input to the SpyreParallelLMHead resides on CPU.
-        # Due to a second limitation of torch-spyre regarding sizes that can be used
-        # in a F.linear layer, the original weights need to be padded
-        out = F.linear(
-            convert(x, device=self.weight.device),
-            self.padded_weight.data,
-            bias,
-        )
-
-        out_cpu = convert(out, device="cpu")
-        out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        return convert(out_cpu_no_pad, device=x_device)
+        return forward_lm_head_oot(self, x, bias)
