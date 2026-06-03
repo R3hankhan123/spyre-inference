@@ -161,11 +161,14 @@ def probe_native_gather(device, device_group, world_size, rank):
 
 
 def probe_merged_column_parallel_linear(device, device_group, world_size, rank):
-    """TP=N MergedColumnParallelLinear forward vs single-rank F.linear.
-    Constructs MergedColumnParallelLinear (OOT-swapped to SpyreMergedColumnParallelLinear),
-    loads each rank's output-dim shard from deterministic full weight, runs
-    forward, and asserts the result matches single-rank F.linear.
+    """TP=N SpyreMergedColumnParallelLinear forward vs single-rank F.linear.
 
+    Models the gate_up_proj usage: output_sizes=[gate, up], so the per-rank
+    weight is [gate_shard | up_shard] stacked rows-wise (each shard is the
+    rank's slice of the corresponding full matrix). The expected output is
+    the per-shard F.linear results concatenated along the output dim — a
+    naive contiguous row-slice would mask a layout bug, so we build the
+    weight shard-by-shard.
     """
     import torch.nn.functional as F
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -174,33 +177,35 @@ def probe_merged_column_parallel_linear(device, device_group, world_size, rank):
     from spyre_inference.custom_ops.utils import convert
 
     input_size = 512
-    output_size = 1024
+    output_size = 1024  # per-shard size (gate, up)
 
     layer = MergedColumnParallelLinear(
         input_size,
-        [output_size],
+        [output_size, output_size],
         bias=False,
         params_dtype=torch.float16,
-        gather_output=False,
     )
     assert isinstance(layer, SpyreMergedColumnParallelLinear), type(layer)
 
     torch.manual_seed(42)
-    full_weight = torch.randn(output_size, input_size, dtype=torch.float16) * 0.02
+    gate_full = torch.randn(output_size, input_size, dtype=torch.float16) * 0.02
+    up_full = torch.randn(output_size, input_size, dtype=torch.float16) * 0.02
 
-    output_size_per_partition = output_size // world_size
-    start = rank * output_size_per_partition
-    end = (rank + 1) * output_size_per_partition
-    layer.weight.data.copy_(full_weight[start:end])
+    shard = output_size // world_size
+    start = rank * shard
+    end = (rank + 1) * shard
+    layer.weight.data.copy_(torch.cat([gate_full[start:end], up_full[start:end]], dim=0))
     layer.to(device)
 
     torch.manual_seed(7)
     x = torch.randn(16, input_size, dtype=torch.float16)
 
-    out, bias = layer(convert(x, device=device))
+    out, _ = layer(convert(x, device=device))
     out = convert(out, device="cpu")
-    expected_full = F.linear(x, full_weight)
-    expected = expected_full[:, start:end]
+    expected = torch.cat(
+        [F.linear(x, gate_full)[:, start:end], F.linear(x, up_full)[:, start:end]],
+        dim=-1,
+    )
     torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
     dist.barrier(device_ids=[device.index])
 
@@ -208,10 +213,13 @@ def probe_merged_column_parallel_linear(device, device_group, world_size, rank):
 def probe_qkv_parallel_linear(device, device_group, world_size, rank):
     """TP=N SpyreQKVParallelLinear forward vs single-rank F.linear.
 
-    Constructs QKVParallelLinear (OOT-swapped to SpyreQKVParallelLinear),
-    loads each rank's Q/K/V shard from deterministic full weight, runs
-    forward with gather_output=False, and asserts the result
-    matches single-rank F.linear.
+    Uses GQA shape (total_num_heads != total_num_kv_heads) so a naive
+    "slice the full weight row-wise per rank" load — which would pass for
+    MHA — actually mismatches the real per-rank `[Q | K | V]` layout.
+    The probe loads each shard from its corresponding full Q/K/V matrix
+    using the same head/replica math QKVParallelLinear performs in
+    __init__, then asserts each rank's output matches the concatenation
+    of per-shard F.linear results.
     """
     import torch.nn.functional as F
     from vllm.model_executor.layers.linear import QKVParallelLinear
@@ -220,37 +228,64 @@ def probe_qkv_parallel_linear(device, device_group, world_size, rank):
     from spyre_inference.custom_ops.utils import convert
 
     hidden_size = 512
-    num_heads = 8
-    head_dim = 64
-    total_num_heads = num_heads  # total_num_heads = num_heads + 2 * num_kv_heads
+    head_size = 64
+    total_num_heads = 8
+    total_num_kv_heads = 2  # GQA: kv heads < query heads
 
     layer = QKVParallelLinear(
         hidden_size,
-        head_dim,
+        head_size,
         total_num_heads,
+        total_num_kv_heads=total_num_kv_heads,
         bias=False,
         params_dtype=torch.float16,
     )
     assert isinstance(layer, SpyreQKVParallelLinear), type(layer)
 
-    actual_output_size = layer.weight.shape[0] * world_size
+    # Mirror QKVParallelLinear.__init__ partitioning math.
+    num_heads = total_num_heads // world_size
+    if world_size >= total_num_kv_heads:
+        num_kv_heads = 1
+        num_kv_head_replicas = world_size // total_num_kv_heads
+    else:
+        num_kv_heads = total_num_kv_heads // world_size
+        num_kv_head_replicas = 1
+    assert layer.num_heads == num_heads
+    assert layer.num_kv_heads == num_kv_heads
+    assert layer.num_kv_head_replicas == num_kv_head_replicas
+
+    q_full_rows = total_num_heads * head_size
+    kv_full_rows = total_num_kv_heads * head_size
 
     torch.manual_seed(43)
-    full_weight = torch.randn(actual_output_size, hidden_size, dtype=torch.float16) * 0.02
+    q_full = torch.randn(q_full_rows, hidden_size, dtype=torch.float16) * 0.02
+    k_full = torch.randn(kv_full_rows, hidden_size, dtype=torch.float16) * 0.02
+    v_full = torch.randn(kv_full_rows, hidden_size, dtype=torch.float16) * 0.02
 
-    qkv_size_per_partition = actual_output_size // world_size
-    start = rank * qkv_size_per_partition
-    end = (rank + 1) * qkv_size_per_partition
-    layer.weight.data.copy_(full_weight[start:end])
+    q_start = rank * num_heads * head_size
+    q_end = q_start + num_heads * head_size
+    kv_shard_idx = rank // num_kv_head_replicas
+    kv_start = kv_shard_idx * num_kv_heads * head_size
+    kv_end = kv_start + num_kv_heads * head_size
+
+    q_shard = q_full[q_start:q_end]
+    k_shard = k_full[kv_start:kv_end]
+    v_shard = v_full[kv_start:kv_end]
+    layer.weight.data.copy_(torch.cat([q_shard, k_shard, v_shard], dim=0))
     layer.to(device)
 
     torch.manual_seed(8)
     x = torch.randn(16, hidden_size, dtype=torch.float16)
 
-    out, bias = layer(convert(x, device=device))
-    out = convert(out, device="cpu")
-    expected_full = F.linear(x, full_weight)
-    expected = expected_full[:, start:end]
+    out, _ = layer(convert(x, device=device))
+    expected = torch.cat(
+        [
+            F.linear(x, q_shard),
+            F.linear(x, k_shard),
+            F.linear(x, v_shard),
+        ],
+        dim=-1,
+    )
     torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
     dist.barrier(device_ids=[device.index])
 
