@@ -41,11 +41,6 @@ References:
 
 import torch.nn.functional as F
 
-
-from vllm.distributed import (
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_reduce,
-)
 from vllm.logger import init_logger
 
 from spyre_inference.distributed.spyre_communicator import (
@@ -108,28 +103,15 @@ class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinea
     """
 
     def forward(self, input_):
-        """Forward pass with TP support.
-
-        At TP=1: Standard F.linear + bias handling
-        At TP>1: Sharded F.linear per rank
-        """
-        bias = self.bias if not self.skip_bias_add else None
-
-        output_parallel = self.quant_method.apply(self, input_, bias)
-
         if self.gather_output and self.tp_size > 1:
             raise NotImplementedError(
                 _spyre_collective_unsupported_message(
                     "allgather",
-                    self.world_size,
+                    self.tp_size,
                     blocker="libspyre_comms list-form allgather + torch-spyre",
                 )
             )
-
-        if not self.return_bias:
-            return output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
-        return output_parallel, output_bias
+        return super().forward(input_)
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
@@ -141,32 +123,24 @@ class SpyreQKVParallelLinear(SpyreLinearBase, QKVParallelLinear):
     cannot handle strided views on Spyre.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # QKVParallelLinear hardcodes gather_output=False; all_gather is not yet
+        # supported on Spyre, so we rely on this invariant holding.
+        assert not self.gather_output, (
+            f"{self.__class__.__name__} requires gather_output=False; "
+            "all_gather is not yet supported on Spyre"
+        )
+
     def forward(self, input_):
-        """Forward pass with TP support and device handling.
-
-        At TP=1: Standard F.linear + D2H transfer for CPU .split() compatibility
-        At TP>1: Sharded F.linear per rank (outputs remain sharded) + D2H transfer
-        """
-        bias = self.bias if not self.skip_bias_add else None
-
-        output_parallel = self.quant_method.apply(self, input_, bias)
-
-        if self.gather_output and self.tp_size > 1:
-            raise NotImplementedError(
-                _spyre_collective_unsupported_message(
-                    "allgather",
-                    self.world_size,
-                    blocker="libspyre_comms list-form allgather + torch-spyre",
-                )
-            )
-
-        # D2H before downstream .split() — Spyre can't handle strided views
-        output = convert(output_parallel, device="cpu")
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        result = super().forward(input_)
+        # D2H so that GraniteAttention's qkv.split() and the subsequent
+        # v.view() + kv_cache scatter-write run on CPU. Spyre rejects a
+        # non-contiguous tensor as a scatter source; see
+        # test_spyre_strided_scatter_source for the minimal reproduction.
+        if self.return_bias:
+            return convert(result[0], device="cpu"), result[1]
+        return convert(result, device="cpu")
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
@@ -176,36 +150,9 @@ class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
     Supports TP>=1 with weight sharding along input dimension and
     all_reduce for aggregating results across ranks when reduce_results=True.
 
-    RowParallelLinear is invoked from both attention and MLP layers
+    RowParallelLinear is invoked from GraniteAttention (input on cpu) and
+    GraniteMLP (input on spyre); H2D is a no-op in the latter case.
     """
 
     def forward(self, input_):
-        """Forward pass with TP support and device handling.
-
-        At TP=1: H2D transfer + F.linear + bias handling
-        At TP>1: Input split (if needed) + H2D transfer + sharded F.linear + all_reduce
-        """
-        # H2D before matmul to ensure input is on Spyre device
-        input_ = convert(input_, device=self.weight.device)
-
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            if self.tp_size > 1:
-                split_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
-                input_parallel = split_input[self.tp_rank].contiguous()
-            else:
-                input_parallel = input_
-
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-
-        if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return super().forward(convert(input_, device=self.weight.device))
