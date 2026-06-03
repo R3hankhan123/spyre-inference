@@ -43,9 +43,6 @@ import torch.nn.functional as F
 
 from vllm.logger import init_logger
 
-from spyre_inference.distributed.spyre_communicator import (
-    _spyre_collective_unsupported_message,
-)
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -97,21 +94,9 @@ class SpyreLinearBase:
 class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinear):
     """Spyre MergedColumnParallelLinear with TP support.
 
-    Supports TP>=1 with weight sharding along output dimension.
-    Note: gather_output is not supported (all_gather not yet implemented).
-    Outputs remain sharded across ranks.
+    Supports TP>=1 with weight sharding along output dimension. Inherits
+    forward() unchanged; the SpyreLinearBase mixin swaps in SpyreUnquantizedLinearMethod.
     """
-
-    def forward(self, input_):
-        if self.gather_output and self.tp_size > 1:
-            raise NotImplementedError(
-                _spyre_collective_unsupported_message(
-                    "allgather",
-                    self.tp_size,
-                    blocker="libspyre_comms list-form allgather + torch-spyre",
-                )
-            )
-        return super().forward(input_)
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
