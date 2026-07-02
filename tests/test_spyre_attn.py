@@ -26,6 +26,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 
+pytestmark = pytest.mark.attention
+
 
 def _spyre_available() -> bool:
     try:
@@ -146,7 +148,6 @@ def assert_close_outliers(
     *,
     outlier_atol: float | None = None,
     outlier_rtol: float | None = None,
-    msg: str = "",
 ) -> None:
     """Assert tensors are close, allowing up to *max_outliers* elements to exceed tolerance.
 
@@ -179,7 +180,7 @@ def assert_close_outliers(
                 raise AssertionError(
                     f"{n_outliers} outlier(s) exceed base tolerances, "
                     f"and at least one outlier also exceeds the relaxed bound "
-                    f"(worst diff={worst:.4g}). {msg}"
+                    f"(worst diff={worst:.4g})."
                 )
         if n_outliers > 0:
             print(
@@ -200,8 +201,8 @@ def assert_close_outliers(
         raise AssertionError(
             f"{prefix}"
             f"max_outliers={max_outliers} was specified "
-            f"but {n_outliers} element(s) exceed tolerance."
-            f"{msg}"
+            f"but {n_outliers} element(s) exceed tolerance.\n"
+            f"{e}"
         ) from e
 
 
@@ -486,7 +487,6 @@ def test_spyre_attn(
         rtol=rtol,
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
-        msg="test_spyre_attn",
     )
 
 
