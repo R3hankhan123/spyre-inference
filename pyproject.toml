@@ -110,7 +110,7 @@ vllm = [
   { git = "https://github.com/vllm-project/vllm", rev = "v0.23.0", marker = "sys_platform != 'linux'" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f539107ded5ac76cf7d3175e7e37532a3b7f058c" }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
+hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "3244d1e2dce134dec99b4dfb58e423469cc069a3" }
 torch = [
   { index = "pytorch-cpu" },
 ]

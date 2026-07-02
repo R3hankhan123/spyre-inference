@@ -89,12 +89,10 @@ tests:
             override:
               "model,model_impl":
               - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "transformers"]
+              - ["meta-llama/Llama-3.2-1B-Instruct", "transformers"]
         - test: "test_distributed"
           mode: mandatory_pass
           tags: [transformers, upstream, uses_subprocess, distributed]
-          params:
-            override:
-              model: ["ibm-ai-platform/micro-g3.3-8b-instruct-1b"]
       block_list:
         - test: "test_quantization"
         - test: "test_embed_loading"
