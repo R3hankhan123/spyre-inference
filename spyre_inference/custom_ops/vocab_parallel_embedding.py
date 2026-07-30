@@ -31,7 +31,13 @@ logger = init_logger(__name__)
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
-    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device.
+
+    Embedding runs natively on Spyre via indirect access (gather).  The only
+    remaining CPU detour is the TP-masking arithmetic for TP > 1, because
+    ``get_masked_input_and_mask`` performs int64 comparisons that the Spyre
+    inductor backend still rejects.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -41,13 +47,9 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
-    def _apply(self, fn, recurse=True):
-        # F.embedding has no Spyre kernel; keep the weight on CPU.
-        return self
-
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        cpu_input = convert(input_, device="cpu")
         if self.tp_size > 1:
+            cpu_input = convert(input_, device="cpu")
             masked_input, input_mask = get_masked_input_and_mask(
                 cpu_input,
                 self.shard_indices.org_vocab_start_index,
@@ -56,14 +58,15 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
+            masked_input = convert(masked_input, device=input_.device)
         else:
-            masked_input = cpu_input
+            masked_input = input_
 
         output_parallel = self.quant_method.embedding(self, masked_input.long())
-        output_parallel = convert(output_parallel, device=input_.device)
 
         if self.tp_size > 1:
-            keep = (~input_mask).to(output_parallel.dtype).unsqueeze(-1)
-            output_parallel = output_parallel * keep.to(output_parallel.device)
+            keep = (~input_mask).unsqueeze(-1)
+            keep = convert(keep, device=output_parallel.device, dtype=output_parallel.dtype)
+            output_parallel = output_parallel * keep
 
         return tensor_model_parallel_all_reduce(output_parallel)

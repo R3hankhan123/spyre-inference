@@ -149,9 +149,9 @@ def test_spyre_index_select_for_rope(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-# Note: the embedding CPU-fallback probe lives in
-# tests/test_vocab_parallel_embedding.py::test_embedding_cpu_fallback_xfail
-# (xfail strict). It is intentionally not duplicated here.
+# Note: embedding now runs natively on Spyre via indirect access (no CPU
+# fallback). The positive assertion lives in
+# tests/test_vocab_parallel_embedding.py::test_embedding_does_not_fall_back_to_cpu.
 
 
 # ---------------------------------------------------------------------------

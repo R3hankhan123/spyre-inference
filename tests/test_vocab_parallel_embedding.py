@@ -16,14 +16,16 @@
 
 Coverage:
   1. OOT class swap.
-  2. TP=1 forward matches `F.embedding`.
+  2. TP=1 forward matches `F.embedding` (embedding runs on Spyre via
+     indirect access).
   3. "Fake TP=2" forward (patched rank/world, all_reduce stubbed) sums
      to the full-vocab `F.embedding` reference — i.e. masking +
      per-rank re-indexing compute the right thing.
   4. Strict-xfail tripwire on the int64 `tensor >= int_const` Spyre
-     compile failure that motivates the CPU-bounce in
+     compile failure that motivates the CPU-bounce for TP-masking in
      SpyreVocabParallelEmbedding.forward. When the tripwire flips to
-     passing, this custom op can likely be deleted.
+     passing, the TP-masking CPU detour can be removed.
+  5. Embedding runs natively on Spyre (no FallbackWarning).
 
 Real TP=2 collective correctness on hardware lives in
 `tests/test_distributed_tp2.py`.
@@ -130,8 +132,8 @@ def test_fake_tp2_forward_matches_reference(
 
 # --- int64 comparison tripwire ---------------------------------------------
 #
-# SpyreVocabParallelEmbedding.forward currently bounces TP-mask compute to
-# CPU because the upstream `get_masked_input_and_mask` does
+# SpyreVocabParallelEmbedding.forward bounces TP-mask compute to CPU because
+# the upstream `get_masked_input_and_mask` does
 # `input_ >= org_vocab_start_index` under @torch.compile, and Spyre's
 # inductor backend rejects the int64 Python-int constant:
 #
@@ -139,10 +141,10 @@ def test_fake_tp2_forward_matches_reference(
 #     Constant(value=N, dtype=torch.int64) to greaterequal
 #
 # A 0-D tensor workaround compiles but produces silently-wrong values, so
-# CPU bounce is the only correct path today. This tripwire is
-# xfail(strict=True): when it flips to passing, delete the custom
-# SpyreVocabParallelEmbedding and check that the upstream code correctly runs
-# on TP > 1.
+# CPU bounce for the masking is the only correct path today. This tripwire
+# is xfail(strict=True): when it flips to passing, remove the TP-masking
+# CPU detour in SpyreVocabParallelEmbedding.forward and let the upstream
+# masking run on-device.
 
 
 @pytest.mark.xfail(
@@ -150,13 +152,11 @@ def test_fake_tp2_forward_matches_reference(
     reason=(
         "Spyre's inductor backend rejects int64 Python-int constants in "
         "comparisons: `Constant(value=N, dtype=torch.int64) to greaterequal`. "
-        "This is the load-bearing limitation behind SpyreVocabParallelEmbedding's "
-        "CPU bounce — upstream `get_masked_input_and_mask` runs `input_ >= "
-        "org_vocab_start_index` under @torch.compile. A 0-D-tensor workaround "
-        "compiles but produces silently-wrong values, so CPU bounce is the only "
-        "correct path. When this flips to passing, delete the CPU bounce in "
-        "SpyreVocabParallelEmbedding.forward and let the upstream forward path "
-        "run on-device."
+        "This is the load-bearing limitation behind the TP-masking CPU detour "
+        "in SpyreVocabParallelEmbedding — upstream `get_masked_input_and_mask` "
+        "runs `input_ >= org_vocab_start_index` under @torch.compile. When "
+        "this flips to passing, remove the TP-masking CPU bounce and let the "
+        "upstream masking path run on-device."
     ),
 )
 def test_int64_compiled_compare_against_python_int(tp_group) -> None:
@@ -172,15 +172,8 @@ def test_int64_compiled_compare_against_python_int(tp_group) -> None:
     torch.testing.assert_close(out.cpu(), expected)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre routes aten.embedding.default to CPU. When this flips to "
-        "passing, remove the CPU pin in TorchSpyreModelRunner.load_model and "
-        "the forward-path CPU bounce in SpyreVocabParallelEmbedding."
-    ),
-)
 def test_embedding_does_not_fall_back_to_cpu() -> None:
+    """Embedding runs natively on Spyre via indirect access (no CPU fallback)."""
     from torch_spyre.ops.fallbacks import FallbackWarning
 
     weight = torch.randn(128, 64, dtype=torch.float16, device="spyre")
