@@ -24,3 +24,15 @@ class SpyreLogitsProcessor(LogitsProcessor):
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Gather TP-sharded logits on Spyre, then move the result to CPU."""
         return convert(super()._gather_logits(logits), device="cpu")
+
+    def _get_logits(self, hidden_states, lm_head, embedding_bias=None):
+        """Ensure logits land on CPU regardless of TP size.
+
+        For TP>1 ``_gather_logits`` already converts to CPU.  For TP=1 the
+        gather is skipped by upstream, so logits would stay on Spyre and the
+        downstream ``logits *= scale`` / ``logits.to(float32)`` would crash.
+        """
+        logits = super()._get_logits(hidden_states, lm_head, embedding_bias)
+        if logits is not None and logits.device.type != "cpu":
+            logits = convert(logits, device="cpu")
+        return logits

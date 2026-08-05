@@ -84,16 +84,13 @@ def test_merged_column_matches_reference(
 )
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, head_size, use_bias):
-    """An un-fused qkv_proj returns a SplitQKV whose (q, k, v) match the
-    fused upstream F.linear.
-
-    analyze_and_unfuse splits the fused weight on CPU and rebinds forward to
-    return a SplitQKV container; the unmodified `qkv.split(...)` idiom then
-    yields three contiguous tensors — no slice on a Spyre tensor.
+    """Fused qkv_proj on Spyre: the OOT subclass runs the standard
+    ``ColumnParallelLinear.forward`` (``F.linear`` with the fused weight).
+    The q/k/v split is handled at the attention-module level by compiling
+    the parent module's forward for indirect access.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
-    from spyre_inference.custom_ops.unfuse import SplitQKV, analyze_and_unfuse
 
     dtype = torch.float16
     hidden_size = num_heads * head_size
@@ -111,41 +108,24 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     )
     assert isinstance(layer, SpyreQKVParallelLinear)
 
-    # torch.empty() leaves memory uninitialised (may contain NaN in float16);
-    # fill with small random values so the comparison is meaningful.
     layer.weight.data.normal_(std=0.02)
     if layer.bias is not None:
         layer.bias.data.zero_()
 
-    # Capture the fused reference BEFORE the pass destructively un-fuses.
     torch.manual_seed(1)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    # A bare QKV layer (no parent) still gets un-fused — QKV detection does
-    # not require a sibling.
-    analyze_and_unfuse(layer)
-    assert layer.weight is None, "fused weight should be cleared to None"
-    for attr in ("q_weight", "k_weight", "v_weight"):
-        assert hasattr(layer, attr), f"missing unfused param {attr}"
-
     layer = layer.to("spyre")
     qkv, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(qkv, SplitQKV)
-    # Exercise the unmodified downstream idiom.
+    assert isinstance(qkv, torch.Tensor)
+
     q_size = num_heads * head_size
     kv_size = num_kv_heads * head_size
-    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-    actual = torch.cat([q, k, v], dim=-1)
+    assert qkv.shape == (num_tokens, q_size + kv_size + kv_size)
 
-    assert q.shape == (num_tokens, q_size)
-    assert k.shape == (num_tokens, kv_size)
-    assert v.shape == (num_tokens, kv_size)
-    # Each part is contiguous on Spyre — no view, no D2H workaround needed.
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(qkv.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.mlp
@@ -194,8 +174,7 @@ def test_qkv_oot_registration(tp_group):
     """QKVParallelLinear is swapped for the Spyre OOT subclass.
 
     Merged/Row parallel linears are intentionally NOT subclassed: unquantized
-    apply() on Spyre is already plain F.linear, and the gate/up + qkv weights
-    are handled by analyze_and_unfuse. Only QKV keeps a subclass, to assert
+    apply() on Spyre is already plain F.linear. QKV keeps a subclass to assert
     the gather_output=False invariant.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear

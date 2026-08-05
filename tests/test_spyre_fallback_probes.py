@@ -108,11 +108,10 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     strict=True,
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
-        "an indexed scatter write. Historically this forced SpyreQKVParallelLinear "
-        "to D2H its result before returning; the current Spyre path side-steps it "
-        "by un-fusing the QKV weight after load. The probe is kept because the "
-        "underlying torch-spyre limitation still gates attention's per-token "
-        "KV-cache scatter and other rework."
+        "an indexed scatter write. QKV projections now use indirect access "
+        "under torch.compile (no CPU un-fusing), but the underlying strided "
+        "scatter limitation still gates attention's per-token KV-cache scatter "
+        "and other rework."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):

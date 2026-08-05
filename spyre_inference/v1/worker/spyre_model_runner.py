@@ -57,7 +57,6 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -405,9 +404,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV projections.
-        analyze_and_unfuse(self.model)
-
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
@@ -474,6 +470,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
+            self._compile_qkv_attention_modules()
             return
 
         # Trigger whole-model compile:
@@ -490,6 +487,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
             type(self.get_model()).__name__,
             time.time() - t0,
         )
+
+    def _compile_qkv_attention_modules(self) -> None:
+        """Compile each attention module whose child is a SpyreQKVParallelLinear.
+
+        Puts the fused QKV matmul and the downstream ``Tensor.split`` in one
+        compiled graph so indirect access handles the strided views.
+        """
+        from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
+
+        compiled_ids: set[int] = set()
+        for module in self.model.modules():
+            has_qkv_child = any(
+                isinstance(child, SpyreQKVParallelLinear) for child in module.children()
+            )
+            if has_qkv_child and id(module) not in compiled_ids:
+                module.forward = torch.compile(
+                    module.forward,
+                    dynamic=False,
+                )
+                compiled_ids.add(id(module))
+
+        if compiled_ids:
+            logger.info(
+                "enforce_eager: compiled %d attention module(s) for QKV indirect access.",
+                len(compiled_ids),
+            )
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.
