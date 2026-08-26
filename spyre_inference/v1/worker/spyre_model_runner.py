@@ -294,6 +294,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_stashed_hidden_states", None)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64
@@ -320,11 +321,26 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
+            if isinstance(result, torch.Tensor) and result.shape[0] == 1:
+                # Decode fast path: single-token result. The upstream code will
+                # do hidden_states[logits_indices] which trivially selects the
+                # whole tensor, then passes it to compute_logits. Skip the D2H
+                # entirely — stash the device tensor and return a CPU placeholder
+                # that carries the correct shape/dtype for upstream indexing.
+                object.__setattr__(self, "_stashed_hidden_states", result)
+                result = torch.zeros(result.shape, dtype=result.dtype, device="cpu")
+            else:
+                # Prefill / multi-token: D2H as usual (upstream needs real values
+                # for logits_indices slicing across multiple requests).
+                if isinstance(result, torch.Tensor):
+                    object.__setattr__(self, "_stashed_hidden_states", result)
+                else:
+                    object.__setattr__(self, "_stashed_hidden_states", None)
 
-            def _to_cpu(x):
-                return convert(x, device="cpu")
+                def _to_cpu(x):
+                    return convert(x, device="cpu")
 
-            result = tree_map(_to_cpu, result)
+                result = tree_map(_to_cpu, result)
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -333,17 +349,19 @@ class _SpyreModelWrapper:
         return result
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        """Move hidden_states onto Spyre for the lm_head custom op.
+        """Run lm_head on Spyre, reusing the stashed on-device tensor when possible.
 
-        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        For decode (bs=1), the stashed tensor from __call__ has the same shape
+        as sample_hidden_states, so we skip the redundant H2D. For prefill or
+        multi-request batches where upstream sliced a subset, we fall back to
+        converting the CPU tensor.
         """
-        hidden_states = convert(hidden_states, device=self._spyre_device)
+        stashed = self._stashed_hidden_states
+        if stashed is not None and stashed.shape == hidden_states.shape:
+            hidden_states = stashed
+        else:
+            hidden_states = convert(hidden_states, device=self._spyre_device)
+        object.__setattr__(self, "_stashed_hidden_states", None)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
 
     def __getattr__(self, name):
