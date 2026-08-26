@@ -46,6 +46,11 @@ logger = init_logger(__name__)
 # in torch.profiler.record_function spans for kineto trace capture.
 _ATTN_PROFILING = os.environ.get("SPYRE_ATTN_PROFILING", "0") == "1"
 
+# HND cache layout: stores pages as [num_blocks, num_kv_heads, block_size, head_size].
+# Eliminates the per-page permute(1, 0, 2) in the attention loop, reducing decode ITL
+# for long sequences where reads (one per page per step) dominate writes (one per token).
+_USE_HND_CACHE = os.environ.get("SPYRE_KV_CACHE_HND", "0") == "1"
+
 
 def _record_function(name: str):
     def decorator(fn):
@@ -84,9 +89,10 @@ INT32_ELEMS_PER_STICK = 32
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    Each field is one dense tensor of shape
-    [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
-    matching `SpyreAttentionBackend.get_kv_cache_shape`.
+    Each field is one dense tensor on the Spyre device, matching
+    `SpyreAttentionBackend.get_kv_cache_shape`:
+      - NHD (default): [num_blocks, block_size, num_kv_heads, head_size]
+      - HND (SPYRE_KV_CACHE_HND=1): [num_blocks, num_kv_heads, block_size, head_size]
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
@@ -118,6 +124,29 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
+def hnd_kv_layout(
+    num_blocks: int, num_kv_heads: int, block_size: int, head_size: int, dtype: torch.dtype
+):
+    """Device layout for HND cache [num_blocks, num_kv_heads, block_size, head_size].
+
+    4D device structure mirroring slot_major_kv_layout: merges (block, head) into the
+    outermost device dim, keeps block_size as the second dim, and splits head_size into
+    (sticks, eps). This makes:
+      - index_select(0, page_idx) fetch one contiguous block (H*S*D elements)
+      - reshape(-1, D) give a flat [B*H*S, D] view for the index_copy_ write
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (head_size + eps - 1) // eps
+    bh = num_blocks * num_kv_heads
+    return SpyreTensorLayout(
+        device_size=[bh, block_size, sticks, eps],
+        stride_map=[block_size * sticks * eps, sticks * eps, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
 def _maybe_compile(fn, compile_enabled: bool):
     """Compile `fn` when enabled. Attention compiles separately from the model's
     fullgraph capture, which can't hold its per-sequence Python loop.
@@ -130,6 +159,30 @@ def _maybe_compile(fn, compile_enabled: bool):
 def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+def _make_hnd_cache_kernel(num_kv_heads: int, block_size: int):
+    """Factory: returns a compiled HND write kernel with H and S baked in.
+
+    Computes scatter indices on-device from slot_mapping using only multiply,
+    subtract, and bitwise_and (block_size is always a power of 2 on Spyre).
+    This eliminates the separate CPU index computation and H2D transfer that
+    the previous approach required.
+    """
+    H = num_kv_heads
+    S_MASK = block_size - 1  # 63 for block_size=64
+    H_MINUS_1 = H - 1
+
+    def kernel(key, value, k_flat, v_flat, slot_mapping, head_offsets):
+        # slot_mapping: [T] int32 on device
+        # head_offsets: [H] int32 on device = [0, S, 2S, ..., (H-1)*S]
+        offset = torch.bitwise_and(slot_mapping, S_MASK)  # slot % S
+        base = slot_mapping * H - offset * H_MINUS_1  # block_idx * H * S + offset
+        hnd_index = (base.unsqueeze(1) + head_offsets.unsqueeze(0)).reshape(-1)
+        k_flat.index_copy_(0, hnd_index, key)
+        v_flat.index_copy_(0, hnd_index, value)
+
+    return kernel
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +199,12 @@ def _create_compilable_page_attn(
     logits_soft_cap: float = 0.0,
     store_mode: str = "none",
     store_len: int = 0,
+    use_hnd: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
-    logits_soft_cap, store_mode, and store_len are closure constants.
+    logits_soft_cap, store_mode, store_len, and use_hnd are closure constants.
     """
 
     def specialized_paged_attn_kernel(
@@ -169,8 +223,9 @@ def _create_compilable_page_attn(
 
         Expected shapes:
             q: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
-            v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+            k_pages (NHD): [num_blocks_total, block_size, num_kv_heads, head_size]
+            k_pages (HND): [num_blocks_total, num_kv_heads, block_size, head_size]
+            v_pages: same layout as k_pages
             page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
                 tensor, row i holding the i-th active block's page index at
                 column 0.
@@ -197,9 +252,17 @@ def _create_compilable_page_attn(
             page_idx = page_index_table[i, 0:1]
             k_page = k_pages.index_select(0, page_idx)
             v_page = v_pages.index_select(0, page_idx)
-            # Token-major page to head-major for the matmuls; permutes on device.
-            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+
+            if use_hnd:
+                # HND: page is [1, num_kv_heads, block_size, head_size] — already
+                # head-major. squeeze + unsqueeze gives [H, 1, S, D] with no data move.
+                k_page_4d = k_page.squeeze(0).unsqueeze(1)
+                v_page_4d = v_page.squeeze(0).unsqueeze(1)
+            else:
+                # NHD: page is [1, block_size, num_kv_heads, head_size] — token-major,
+                # permute to head-major for the matmuls.
+                k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+                v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
@@ -793,6 +856,8 @@ class SpyreAttentionBackend(AttentionBackend):
         # K and V are separate tensors in SpyrePagedKVCache, each with the same
         # shape. The base vLLM API expects a single tuple here; callers like
         # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        if _USE_HND_CACHE:
+            return (num_blocks, num_kv_heads, block_size, head_size)
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -811,10 +876,12 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
-    KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
-    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre. Pages are
-    read by indirect access, indexing the dense tensor with a device-resident
-    page index. No gather masks.
+    KV cache is a tuple (k_pages, v_pages) where each is one dense tensor on Spyre:
+      - NHD: [num_blocks, block_size, num_kv_heads, head_size]
+      - HND: [num_blocks, num_kv_heads, block_size, head_size]
+
+    Pages are read by indirect access, indexing the dense tensor with a
+    device-resident page index. No gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -841,6 +908,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.num_queries_per_kv = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+        self._use_hnd = _USE_HND_CACHE
 
         # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
         # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
@@ -871,13 +939,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
-        self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
+        if self._use_hnd:
+            self._reshape_fn = torch.compile(
+                _make_hnd_cache_kernel(num_kv_heads, self.block_size), dynamic=False
+            )
+            self._hnd_head_offsets: torch.Tensor | None = None
+        else:
+            self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
         # Compiled attention loops, keyed by (num_blocks, padded_query_len, store_mode, store_len)
         self._attn_fns: dict[tuple[int, int, str, int], object] = {}
 
         logger.debug_once(
-            "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
+            "Using SpyreAttentionBackend (%s) with a dense paged KV cache and indirect page gather",
+            "HND" if self._use_hnd else "NHD",
         )
 
     def _get_attn_fn(
@@ -901,6 +976,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     store_mode=store_mode,
                     store_len=store_len,
+                    use_hnd=self._use_hnd,
                 ),
                 self._compile_attn,
             )
@@ -940,9 +1016,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 for s in range(table_cpu.shape[0])
             ]
         if attn_metadata.slot_mapping_device is None:
-            attn_metadata.slot_mapping_device = convert(
-                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
-            )
+            slot_cpu = attn_metadata.slot_mapping[:num_actual_tokens]
+            attn_metadata.slot_mapping_device = convert(slot_cpu, device=_target_device)
         if attn_metadata.attention_mask_tiles_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
@@ -999,17 +1074,35 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
             strided last-dim views of the fused QKV output
-        k_pages, v_pages: [num_blocks, block_size, num_kv_heads, head_size]
+        k_pages, v_pages:
+            NHD: [num_blocks, block_size, num_kv_heads, head_size]
+            HND: [num_blocks, num_kv_heads, block_size, head_size]
         slot_mapping: [num_tokens] on the pages' device
         """
-        # A source on the wrong device falls back to CPU silently, without raising.
         assert key.device.type == k_pages.device.type, (
             f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
         )
 
-        # Valid because a view keeps the slot-outermost device layout.
-        slots = (-1, k_pages.shape[2], k_pages.shape[3])
-        self._reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
+        if self._use_hnd:
+            num_tokens = key.shape[0]
+            H = self.num_kv_heads
+            D = self.head_size
+            k_flat = k_pages.reshape(-1, D)
+            v_flat = v_pages.reshape(-1, D)
+            key_flat = key.reshape(num_tokens * H, D)
+            val_flat = value.reshape(num_tokens * H, D)
+            if self._hnd_head_offsets is None:
+                self._hnd_head_offsets = convert(
+                    torch.arange(H, dtype=torch.int32) * self.block_size,
+                    device=key.device,
+                )
+            self._reshape_fn(
+                key_flat, val_flat, k_flat, v_flat, slot_mapping, self._hnd_head_offsets
+            )
+        else:
+            # NHD: view as [num_slots, H, D] and index_copy on dim 0.
+            slots = (-1, k_pages.shape[2], k_pages.shape[3])
+            self._reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
