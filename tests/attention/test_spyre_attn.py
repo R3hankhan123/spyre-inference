@@ -160,7 +160,8 @@ def _build_metadata(
         device=torch.device("cpu"),
     )
 
-    max_query_len = int((query_start_loc[1:] - query_start_loc[:-1]).max().item())
+    query_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
+    max_query_len = int(query_lens_per_seq.max().item())
     max_seq_len = int(seq_lens.max().item())
     num_actual_tokens = int(query_start_loc[-1].item())
 
@@ -175,6 +176,7 @@ def _build_metadata(
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
         causal=True,
+        is_prefilling=(query_lens_per_seq > 1),
     )
 
     return builder.build(
@@ -1899,7 +1901,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
         ),
         pytest.param(
             [(1, 256), (32, 256), (1, 256), (32, 256)],
-            id="mixed_decode_prefill(fallback)",
+            id="mixed_decode_prefill_non_leading(fallback)",
         ),
     ],
 )
@@ -1996,6 +1998,72 @@ def test_bucketed_block_ids_match_scalar_fill(
             )
         for b in range(n_use, b_blocks):
             assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (32, 256)],
+            id="decode_prefix(N=4)+prefill",
+        ),
+        pytest.param(
+            [
+                (1, 256),
+                (1, 512),
+                (1, 128),
+                (1, 384),
+                (1, 256),
+                (1, 512),
+                (1, 128),
+                (1, 384),
+                (64, 256),
+                (32, 512),
+            ],
+            id="decode_prefix(N=8)+2prefills",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (32, 256)],
+            id="decode_prefix(N=5_padded_to_8)+prefill",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (2, 256)],
+            id="decode_prefix(N=5)+tiny_prefill",
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (64, 256)],
+            id="decode_prefix(N=3_below_min)+prefill",
+        ),
+        pytest.param(
+            [(1, 256), (32, 256), (1, 512), (1, 128), (1, 384)],
+            id="decode_prefill_interleaved(fallback)",
+        ),
+    ],
+)
+def test_spyre_attn_mixed_batch_batched_decode(
+    default_vllm_config,
+    enable_batched_decode,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
 
 
 def _padded_mask_metadata(
