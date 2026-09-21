@@ -35,6 +35,7 @@ from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    batch_buckets,
     default_encoder_len_buckets,
     next_bucket,
 )
@@ -105,6 +106,41 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     return ends - 1 if last else ends - counts
 
 
+def pad_seq_indices(indices: torch.Tensor, batch_ladder: list[int]) -> torch.Tensor:
+    """Pad CLS/LAST gather indices to a batch-width bucket.
+
+    ``index_select`` specialises on ``index.numel()``. Without this, every live
+    ``num_seqs`` compiles a new graph (5, then 6, …). Dummy slots repeat the
+    last real row so they stay in-bounds; the caller trims back to ``num_seqs``.
+    """
+    n = int(indices.numel())
+    if n < 1 or not batch_ladder:
+        return indices
+    cap = max(batch_ladder)
+    padded_n = min(next_bucket(min(n, cap), batch_ladder), cap)
+    if padded_n <= n:
+        return indices
+    extra = indices[-1].expand(padded_n - n)
+    return torch.cat((indices, extra), dim=0)
+
+
+def _gather_seq_rows(
+    hidden_states: torch.Tensor,
+    row_indices: torch.Tensor,
+    batch_ladder: list[int],
+) -> torch.Tensor:
+    """Bucketed CLS/LAST gather; drop dummy rows before the length-checked head."""
+    n = int(row_indices.numel())
+    gathered = select_rows(hidden_states, pad_seq_indices(row_indices, batch_ladder))
+    if gathered.shape[0] == n:
+        return gathered
+    # Spyre dim-0 slices are unsafe; dummy rows are dropped on the host.
+    # The extra D2H is at most ``max_num_seqs`` vectors.
+    if gathered.device.type == "spyre":
+        gathered = convert(gathered, "cpu")
+    return gathered[:n]
+
+
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
     """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
@@ -122,21 +158,43 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
 
 
 class SpyreCLSPool(CLSPool):
-    """CLS via ``index_select`` (keeps upstream ``isinstance`` checks)."""
+    """CLS via ``index_select`` (keeps upstream ``isinstance`` checks).
+
+    The gather index is padded to ``batch_ladder`` so ``index_select`` compiles
+    once per batch bucket (1, 2, 4, 8, …), not once per live ``num_seqs``.
+    Dummy slots repeat the last real CLS row; they are trimmed before the head,
+    which requires ``len(pooled) == len(pooling_params)``.
+    """
+
+    def __init__(self, batch_ladder: list[int] | None = None) -> None:
+        super().__init__()
+        self.batch_ladder = list(batch_ladder) if batch_ladder else []
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=False))
+        return _gather_seq_rows(
+            hidden_states,
+            cursor_row_indices_cpu(cursor, last=False),
+            self.batch_ladder,
+        )
 
 
 class SpyreLastPool(LastPool):
-    """LAST via ``index_select``."""
+    """LAST via ``index_select``; same batch-ladder pad as ``SpyreCLSPool``."""
+
+    def __init__(self, batch_ladder: list[int] | None = None) -> None:
+        super().__init__()
+        self.batch_ladder = list(batch_ladder) if batch_ladder else []
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
+        return _gather_seq_rows(
+            hidden_states,
+            cursor_row_indices_cpu(cursor, last=True),
+            self.batch_ladder,
+        )
 
 
 class SpyreMeanPool(MeanPool):
@@ -420,7 +478,9 @@ def patch_embedding_heads_for_spyre(pooler: nn.Module) -> int:
 
 
 def patch_pooler_for_spyre(
-    pooler: nn.Module, len_ladder: list[int] | None = None
+    pooler: nn.Module,
+    len_ladder: list[int] | None = None,
+    batch_ladder: list[int] | None = None,
 ) -> tuple[int, list[str]]:
     """Install Spyre CLS, LAST, MEAN, and token AllPool. Returns ``(n_patched, unsupported)``.
 
@@ -435,13 +495,17 @@ def patch_pooler_for_spyre(
 
     if isinstance(pooler, SequencePooler):
         pooling = pooler.pooling
-        if isinstance(pooling, SpyreCLSPool | SpyreLastPool | SpyreMeanPool):
+        if isinstance(pooling, SpyreCLSPool | SpyreLastPool):
+            if batch_ladder and not pooling.batch_ladder:
+                pooling.batch_ladder = list(batch_ladder)
             num_patched += 1  # already swapped (shared under DispatchPooler)
+        elif isinstance(pooling, SpyreMeanPool):
+            num_patched += 1
         elif isinstance(pooling, CLSPool):
-            pooler.pooling = SpyreCLSPool()
+            pooler.pooling = SpyreCLSPool(batch_ladder=batch_ladder)
             num_patched += 1
         elif isinstance(pooling, LastPool):
-            pooler.pooling = SpyreLastPool()
+            pooler.pooling = SpyreLastPool(batch_ladder=batch_ladder)
             num_patched += 1
         elif isinstance(pooling, MeanPool):
             pooler.pooling = SpyreMeanPool()
@@ -464,7 +528,7 @@ def patch_pooler_for_spyre(
             pooler.pooling.defer_trim = True
     elif isinstance(pooler, DispatchPooler):
         for sub in pooler.poolers_by_task.values():
-            sub_patched, sub_unsupported = patch_pooler_for_spyre(sub, len_ladder)
+            sub_patched, sub_unsupported = patch_pooler_for_spyre(sub, len_ladder, batch_ladder)
             num_patched += sub_patched
             unsupported.extend(sub_unsupported)
     else:
@@ -474,7 +538,10 @@ def patch_pooler_for_spyre(
 
 
 def configure_pooling_for_spyre(
-    model: nn.Module, spyre_device: torch.device, max_model_len: int | None = None
+    model: nn.Module,
+    spyre_device: torch.device,
+    max_model_len: int | None = None,
+    max_num_seqs: int | None = None,
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
@@ -484,10 +551,11 @@ def configure_pooling_for_spyre(
     head is an FP32 linear.
 
     ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
-    It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
-    the pooler because only the caller is guaranteed to run inside a
-    ``set_current_vllm_config`` context; token pooling degrades to plain stick
-    alignment without it.
+    ``max_num_seqs`` builds the batch-width ladder for CLS/LAST. Both are
+    parameters rather than a ``get_current_vllm_config()`` lookup inside the
+    pooler because only the caller is guaranteed to run inside a
+    ``set_current_vllm_config`` context; without them the gathers track the
+    live length / ``num_seqs`` and compile once per distinct value.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
@@ -495,7 +563,14 @@ def configure_pooling_for_spyre(
         return False
 
     len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
-    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
+    batch_ladder = batch_buckets(max_num_seqs) if max_num_seqs else []
+    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder, batch_ladder)
+    has_cls_last = any(isinstance(m, SpyreCLSPool | SpyreLastPool) for m in pooler.modules())
+    if has_cls_last and not batch_ladder:
+        logger.warning(
+            "Pooling: CLS/LAST has no batch ladder (max_num_seqs was not "
+            "passed); gathers use the live num_seqs and compile once per width"
+        )
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__
         logger.info(

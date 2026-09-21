@@ -32,6 +32,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     logits_row_buckets,
     next_bucket,
     pick_encoder_attention_shape,
+    pooling_gather_shapes,
     pooling_warmup_shapes,
 )
 
@@ -221,6 +222,24 @@ class TestEncoderDispatch:
         assert two_d is not None
         assert (two_d.batch_bucket, two_d.len_bucket) == (4, 64)
         assert two_d.padded_num_tokens == 256
+
+    def test_for_pooling_body_buckets_are_compile_sizes_not_cell_products(self):
+        """Overflow cells such as (8, 512)=4096 are attention workspace, not body T."""
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=8, max_num_batched_tokens=2048)
+        cfg.compilation_config.compile_sizes = [64, 128, 256, 512, 1024, 2048]
+        b = SpyreShapeBucketer.for_pooling(cfg)
+        assert b is not None
+        assert (8, 512) in b.encoder_shapes
+        assert b.bucket_sizes == [64, 128, 256, 512, 1024, 2048]
+        assert 3072 not in b.bucket_sizes
+        assert 4096 not in b.bucket_sizes
+
+    def test_pooling_gather_shapes_cover_short_prompts_at_full_batch(self):
+        """Eight ~30-token prompts pad to T=256 with CLS index length 8."""
+        pairs = pooling_gather_shapes([64, 128, 256, 512, 1024, 2048], max_num_seqs=8)
+        assert (256, 8) in pairs
+        assert (2048, 8) in pairs
+        assert (256, 4) in pairs
 
     def test_dispatch_encoder_stays_on_warmed_shapes(self):
         config = MagicMock()

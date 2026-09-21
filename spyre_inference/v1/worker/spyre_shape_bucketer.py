@@ -216,6 +216,25 @@ def pooling_warmup_shapes(
     return sorted(shapes)
 
 
+def pooling_gather_shapes(
+    body_buckets: Sequence[int],
+    max_num_seqs: int,
+) -> list[tuple[int, int]]:
+    """``(source T, index B)`` pairs CLS/LAST ``index_select`` can be called with.
+
+    Body T and attention B are independent. Eight short prompts pad to T=256
+    with B=8; attention-cell dummies pair T with that cell's B*L (512, 2048,
+    …) and never visit (256, 8).
+    """
+    batches = batch_buckets(max_num_seqs)
+    return [
+        (int(num_tokens), batch)
+        for num_tokens in body_buckets
+        if int(num_tokens) > 0
+        for batch in batches
+    ]
+
+
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
     """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
     cap = max(1, max_num_reqs)
@@ -319,22 +338,21 @@ class SpyreShapeBucketer:
         *,
         encoder_shapes: Sequence[tuple[int, int]] | None = None,
     ) -> None:
-        if encoder_shapes is not None:
-            self._encoder_shapes: list[tuple[int, int]] = list(encoder_shapes)
-            self._bucket_sizes: list[int] = sorted(
-                {batch * length for batch, length in self._encoder_shapes}
-            )
-        else:
-            self._encoder_shapes = []
-            compilation_config = vllm_config.compilation_config
-            sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
-            self._bucket_sizes = sorted(sizes)
+        # Body T is always platform ``compile_sizes``. Attention ``(B, L)`` is a
+        # second field; do not derive bucket_sizes from B*L products.
+        sizes = [int(s) for s in (vllm_config.compilation_config.compile_sizes or [])]
+        self._bucket_sizes: list[int] = sorted(sizes)
+        self._encoder_shapes: list[tuple[int, int]] = list(encoder_shapes or [])
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
         self._is_warmed_up = False
 
         if self._encoder_shapes:
             logger.info(
-                "SpyreShapeBucketer initialized with %d encoder (B, L) shapes: %s",
+                "SpyreShapeBucketer initialized with %d body buckets [%d..%d] "
+                "and %d encoder (B, L) shapes: %s",
+                len(self._bucket_sizes),
+                self._bucket_sizes[0] if self._bucket_sizes else 0,
+                self._max_bucket_size,
                 len(self._encoder_shapes),
                 self._encoder_shapes,
             )
@@ -362,11 +380,7 @@ class SpyreShapeBucketer:
         )
         if not shapes and not compile_sizes:
             return None
-        inst = cls(vllm_config, encoder_shapes=shapes or None)
-        if compile_sizes:
-            inst._bucket_sizes = sorted(set(compile_sizes))
-            inst._max_bucket_size = inst._bucket_sizes[-1] if inst._bucket_sizes else 0
-        return inst
+        return cls(vllm_config, encoder_shapes=shapes or None)
 
     @property
     def bucket_sizes(self) -> list[int]:

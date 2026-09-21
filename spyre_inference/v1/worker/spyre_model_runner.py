@@ -106,6 +106,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
     logits_row_buckets,
     next_bucket,
+    pooling_gather_shapes,
     pooling_warmup_shapes,
 )
 
@@ -633,7 +634,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
-                self.model, self._spyre_device, self.model_config.max_model_len
+                self.model,
+                self._spyre_device,
+                max_model_len=self.model_config.max_model_len,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
@@ -832,6 +836,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()
+                self._record_pooling_gather_graphs()
                 if self._spyre_kv_caches:
                     # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
                     # record its (num_blocks, query_len) variants directly, sidestepping
@@ -908,10 +913,61 @@ class TorchSpyreModelRunner(GPUModelRunner):
         for layer in static_ctx.values():
             impl = getattr(layer, "impl", None)
             if isinstance(impl, SpyreEncoderAttentionImpl):
-                total += impl.record_pack_graphs(self._spyre_device)
+                body = (
+                    self.spyre_shape_bucketer.bucket_sizes
+                    if self.spyre_shape_bucketer is not None
+                    else None
+                )
+                total += impl.record_pack_graphs(
+                    self._spyre_device,
+                    body_buckets=body,
+                    max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                )
         logger.info(
             "Encoder pack graph recording complete: %d graphs in %.3fs.",
             total,
+            time.time() - t0,
+        )
+
+    @torch.inference_mode()
+    def _record_pooling_gather_graphs(self) -> None:
+        """Trace CLS/LAST ``index_select`` on every ``(body T, batch B)`` pair.
+
+        Dummy attention cells compile one pair per cell. Serve of eight short
+        prompts is T=256 with B=8, which those dummies never hit.
+        """
+        if not self._pooling_on_spyre or self.spyre_shape_bucketer is None:
+            return
+        device = self._spyre_device
+        if device.type != "spyre":
+            return
+        pairs = pooling_gather_shapes(
+            self.spyre_shape_bucketer.bucket_sizes,
+            self.scheduler_config.max_num_seqs,
+        )
+        if not pairs:
+            return
+        hidden_size = self.model_config.get_hidden_size()
+        dtype = self._model_dtype()
+        t0 = time.time()
+        recorded = 0
+        for num_tokens, batch in pairs:
+            hidden = convert(torch.zeros(num_tokens, hidden_size, dtype=dtype), device)
+            idx = torch.zeros(batch, dtype=torch.int64)
+            try:
+                select_rows(hidden, idx)
+                recorded += 1
+            except Exception:
+                logger.warning(
+                    "Pooling gather graph (T=%d, B=%d) failed to record; "
+                    "it will compile on first use instead.",
+                    num_tokens,
+                    batch,
+                    exc_info=True,
+                )
+        logger.info(
+            "Pooling CLS/LAST gather recording complete: %d graphs in %.3fs.",
+            recorded,
             time.time() - t0,
         )
 

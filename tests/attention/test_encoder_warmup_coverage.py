@@ -349,6 +349,42 @@ class TestPackKernelShapesAreAllRecorded:
         _cells, recorded = self._recorded_keys(MAX_NUM_SEQS, MAX_MODEL_LEN, 2048)
         assert (5 * 512 + 1, 2048) in recorded
 
+    def test_the_measured_unpack_miss_is_covered(self):
+        """Unpack ``index_select`` keys on ``[B·L, H, D]`` × index length ``T``.
+
+        Pack recording used to skip it. Serve of five ~400-token prompts hits
+        packed 2560 with body T=2048; skewed warmup only unpacked at T=1024.
+        """
+        cells = pooling_warmup_shapes(
+            max_num_seqs=MAX_NUM_SEQS,
+            max_model_len=MAX_MODEL_LEN,
+            max_num_batched_tokens=2048,
+            len_bucket=default_encoder_len_buckets(MAX_MODEL_LEN),
+        )
+        triples = reachable_pack_shapes(cells, default_encoder_len_buckets(2048), 2048)
+        assert (5, 512, 2048) in triples
+        unpack_keys = {(batch * length, num_src) for batch, length, num_src in triples}
+        assert (5 * 512, 2048) in unpack_keys
+
+    def test_the_measured_in_budget_unpack_miss_is_covered(self):
+        """Four ~200-token prompts: packed ``4×512=2048``, body T=1024.
+
+        Dummy ``(4, 512)`` fills T=B×L=2048. Serve pads the token sum to 1024.
+        The unpack graph must be the slot-major 3-D ``[2048, H, D]``, not the
+        tiled 5-D view of packed SDPA (that layout is what Dynamo actually
+        missed — see ``_unpack_index_source``).
+        """
+        cells = pooling_warmup_shapes(
+            max_num_seqs=8,
+            max_model_len=MAX_MODEL_LEN,
+            max_num_batched_tokens=2048,
+            len_bucket=default_encoder_len_buckets(MAX_MODEL_LEN),
+        )
+        triples = reachable_pack_shapes(cells, default_encoder_len_buckets(2048), 2048)
+        assert (4, 512, 1024) in triples
+        unpack_keys = {(batch * length, num_src) for batch, length, num_src in triples}
+        assert (4 * 512, 1024) in unpack_keys
+
     def test_dense_single_sequence_is_left_out_but_a_padded_one_is_not(self):
         """``B=1`` skips the pack only when the body bucket *is* the length bucket."""
         body = default_encoder_len_buckets(2048)

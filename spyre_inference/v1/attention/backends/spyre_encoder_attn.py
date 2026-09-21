@@ -569,6 +569,29 @@ def reachable_pack_shapes(
     return sorted(triples)
 
 
+def _unpack_index_source(flat_padded: torch.Tensor) -> torch.Tensor:
+    """``[B·L, H, D]`` with rows at device dim 0, the layout ``index_select`` is traced on.
+
+    ``permute`` + ``reshape`` of packed SDPA keeps a 5-D tiled view
+    (``[L, H, 1, B, D]`` for granite ``(4, 512)``). ``record_pack_graphs`` used
+    to hand that view to ``index_select``, so Dynamo guarded the tiled layout.
+    Serve ``contiguous()`` copies to a 3-D row layout and misses — packed 2048
+    with body T=1024 is the measured case. Copy into a fresh slot-major buffer
+    so recording and serve share one graph.
+    """
+    if flat_padded.device.type != "spyre":
+        return flat_padded
+    src = _zeros_slot_major(
+        flat_padded.shape[0],
+        flat_padded.shape[1],
+        flat_padded.shape[2],
+        flat_padded.dtype,
+        flat_padded.device,
+    )
+    src.copy_(flat_padded)
+    return src
+
+
 def gather_unpack(
     attn_out: torch.Tensor,
     unpack_indices: torch.Tensor,
@@ -586,7 +609,7 @@ def gather_unpack(
     ):
         gathered = flat_padded
     else:
-        gathered = select_rows(flat_padded, unpack_indices)
+        gathered = select_rows(_unpack_index_source(flat_padded), unpack_indices)
     if gathered.shape[-1] == head_size:
         return gathered
     if gathered.device.type == "spyre":
@@ -943,44 +966,67 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         return output
 
-    def record_pack_graphs(self, device: torch.device) -> int:
-        """Trace ``scatter_pack`` on every ``reachable_pack_shapes`` triple.
+    def record_pack_graphs(
+        self,
+        device: torch.device,
+        body_buckets: list[int] | None = None,
+        max_num_batched_tokens: int | None = None,
+    ) -> int:
+        """Trace pack ``index_copy_`` and unpack ``index_select`` on every triple.
 
-        Warmup's dummy runs reach the pack kernel at one body bucket per cell, leaving
-        most of its shape grid uncompiled. Tracing it needs no model forward, so the
-        whole grid is affordable here.
+        Warmup's dummy runs reach each cell at one body bucket (overflow cells
+        skewed, so ``(5, 512)`` unpacks at T=1024). Serve uses the body bucket
+        covering the token sum (2048). Pack recording used to skip unpack, which
+        is a different compiled op: ``index_select`` on ``[B·L, H, D]`` with
+        index length ``T``.
+
+        Unpack ``index_select`` is traced on a fresh slot-major ``[B·L, H, D]``,
+        not the tiled 5-D view ``gather_unpack`` used to pass through — that
+        view never matches serve ``contiguous()``.
+
+        ``body_buckets`` / ``max_num_batched_tokens`` default to the values
+        cached at impl init; the runner passes the live 1D ladder so a stale
+        construction-time budget cannot drop T=1024.
 
         Returns the number of traces; a failure is logged and skipped, costing one lazy
         compile rather than a dead engine.
         """
         if not self._compile_attn or device.type != "spyre":
             return 0
+        body = [int(size) for size in (body_buckets or self._cached_body_buckets)]
+        budget = int(max_num_batched_tokens or self._cached_max_num_batched_tokens)
+        if body:
+            budget = max(budget, max(body))
         triples = reachable_pack_shapes(
             self._cached_encoder_shapes,
-            self._cached_body_buckets,
-            self._cached_max_num_batched_tokens,
+            body,
+            budget,
         )
         # Q packs with num_heads, K/V with num_kv_heads: one family under MHA, two GQA.
         head_counts = sorted({self.num_heads, self.num_kv_heads})
         recorded = 0
-        # The kernel sees B*L + 1 dest rows, not B and L, so equal-area cells share one.
+        # Pack keys on B*L + 1 dest rows; unpack on B*L source rows. Equal-area
+        # cells share both.
         seen: set[tuple[int, int]] = set()
+        seen_unpack_copy: set[tuple[int, int]] = set()
+        head_size_padded = _align_up(self.head_size)
         for batch, aligned_len, num_src in triples:
-            if (batch * aligned_len, num_src) in seen:
+            packed_rows = batch * aligned_len
+            if (packed_rows, num_src) in seen:
                 continue
-            seen.add((batch * aligned_len, num_src))
+            seen.add((packed_rows, num_src))
             # Values never reach the guards but must stay in range: a wide cell at a
             # small body bucket has fewer source rows than sequences, so fill what fits.
             per_seq = min(aligned_len, max(1, num_src // batch))
             filled = min(batch, num_src // per_seq)
+            q_starts = [seq * per_seq for seq in range(filled)]
+            q_lens = [per_seq] * filled
             dest = _indices_for_device(
-                host_scatter_pack_dest(
-                    [seq * per_seq for seq in range(filled)],
-                    [per_seq] * filled,
-                    aligned_len,
-                    num_src,
-                    batch * aligned_len,
-                ),
+                host_scatter_pack_dest(q_starts, q_lens, aligned_len, num_src, packed_rows),
+                device,
+            )
+            unpack_idx = _indices_for_device(
+                host_unpack_indices(q_starts, q_lens, aligned_len, num_src),
                 device,
             )
             for num_heads in head_counts:
@@ -991,7 +1037,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     device,
                 )
                 try:
-                    scatter_pack(flat, dest, batch, aligned_len, _align_up(self.head_size))
+                    scatter_pack(flat, dest, batch, aligned_len, head_size_padded)
+                    recorded += 1
                 except Exception:
                     logger.warning(
                         "Encoder pack graph (B=%d, L=%d, src=%d, H=%d) failed to record; "
@@ -1002,8 +1049,79 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                         num_heads,
                         exc_info=True,
                     )
-                    continue
-                recorded += 1
+                copy_key = (packed_rows, num_heads)
+                if copy_key not in seen_unpack_copy:
+                    seen_unpack_copy.add(copy_key)
+                    # copy_ into slot-major: serve flatten may be the 5-D tiled
+                    # view or a 3-D contiguous copy. Trace both so neither compiles
+                    # at request time.
+                    packed_4d = convert(
+                        torch.zeros(
+                            batch,
+                            num_heads,
+                            aligned_len,
+                            head_size_padded,
+                            dtype=self.model_dtype,
+                        ),
+                        device,
+                    )
+                    try:
+                        _unpack_index_source(
+                            packed_4d.permute(0, 2, 1, 3)
+                            .contiguous()
+                            .reshape(packed_rows, num_heads, head_size_padded)
+                        )
+                        recorded += 1
+                    except Exception:
+                        logger.warning(
+                            "Encoder unpack copy graph (B=%d, L=%d, H=%d, tiled) "
+                            "failed to record; it will compile on first use instead.",
+                            batch,
+                            aligned_len,
+                            num_heads,
+                            exc_info=True,
+                        )
+                    try:
+                        _unpack_index_source(
+                            convert(
+                                torch.zeros(
+                                    packed_rows,
+                                    num_heads,
+                                    head_size_padded,
+                                    dtype=self.model_dtype,
+                                ),
+                                device,
+                            )
+                        )
+                        recorded += 1
+                    except Exception:
+                        logger.warning(
+                            "Encoder unpack copy graph (rows=%d, H=%d, 3d) "
+                            "failed to record; it will compile on first use instead.",
+                            packed_rows,
+                            num_heads,
+                            exc_info=True,
+                        )
+                src = _zeros_slot_major(
+                    packed_rows,
+                    num_heads,
+                    head_size_padded,
+                    self.model_dtype,
+                    device,
+                )
+                try:
+                    select_rows(src, unpack_idx)
+                    recorded += 1
+                except Exception:
+                    logger.warning(
+                        "Encoder unpack graph (B=%d, L=%d, src=%d, H=%d) failed to record; "
+                        "it will compile on first use instead.",
+                        batch,
+                        aligned_len,
+                        num_src,
+                        num_heads,
+                        exc_info=True,
+                    )
         return recorded
 
 

@@ -37,6 +37,7 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 
+from spyre_inference.v1.pool import spyre_pooler as pooler_mod
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
     SpyreCLSPool,
@@ -48,6 +49,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreNormalize,
     SpyreTokenPooler,
     configure_pooling_for_spyre,
+    pad_seq_indices,
     patch_pooler_for_spyre,
     run_pooling_tail_on_cpu,
 )
@@ -274,6 +276,86 @@ def test_configure_pooling_without_max_model_len_leaves_the_ladder_empty():
     model = _model_with_pooler(_token_pooler(AllPool))
     assert configure_pooling_for_spyre(model, _SPYRE) is True
     assert model.pooler.pooling.len_ladder == []
+
+
+# ---------------------------------------------------------------------------
+# Batch ladder: CLS/LAST index_select specialises on index.numel() == num_seqs.
+# Pad onto the same 1/2/4/8 widths attention warms, then trim so the head still
+# sees one row per request.
+# ---------------------------------------------------------------------------
+
+_BATCH_LADDER = [1, 2, 4, 8]
+
+
+def _seq_metadata(counts: list[int]):
+    counts_t = torch.tensor(counts, dtype=torch.int64)
+
+    class _Cursor:
+        num_scheduled_tokens_cpu = counts_t
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    return _Meta()
+
+
+def test_pad_seq_indices_rounds_onto_the_batch_ladder():
+    idx = torch.tensor([0, 2, 4, 6, 8])
+    padded = pad_seq_indices(idx, _BATCH_LADDER)
+    assert padded.tolist() == [0, 2, 4, 6, 8, 8, 8, 8]
+    assert pad_seq_indices(idx[:4], _BATCH_LADDER).tolist() == [0, 2, 4, 6]
+    assert pad_seq_indices(idx, []).tolist() == [0, 2, 4, 6, 8]
+
+
+@pytest.mark.parametrize(
+    ("pool_cls", "expected_rows"),
+    [
+        (SpyreCLSPool, [0, 2, 4, 6, 8]),
+        (SpyreLastPool, [1, 3, 5, 7, 9]),
+    ],
+)
+def test_spyre_cls_last_pads_index_then_trims(monkeypatch, pool_cls, expected_rows):
+    """Five sequences must gather with index length 8, then return five rows."""
+    seen: list[int] = []
+    real = pooler_mod.select_rows
+
+    def recording(hidden_states, row_indices):
+        seen.append(int(row_indices.numel()))
+        return real(hidden_states, row_indices)
+
+    monkeypatch.setattr(pooler_mod, "select_rows", recording)
+
+    counts = [2, 2, 2, 2, 2]
+    hidden = torch.arange(10 * 3, dtype=torch.float16).reshape(10, 3)
+    out = pool_cls(batch_ladder=_BATCH_LADDER)(hidden, _seq_metadata(counts))
+
+    assert seen == [8]
+    assert out.shape[0] == 5
+    assert torch.equal(out, hidden[expected_rows])
+
+
+def test_spyre_cls_pool_skips_pad_on_an_exact_bucket():
+    counts = [2, 2, 2, 2]
+    hidden = torch.arange(8 * 3, dtype=torch.float16).reshape(8, 3)
+    out = SpyreCLSPool(batch_ladder=_BATCH_LADDER)(hidden, _seq_metadata(counts))
+    assert out.shape[0] == 4
+    assert torch.equal(out, hidden[[0, 2, 4, 6]])
+
+
+def test_configure_pooling_threads_max_num_seqs_into_cls_ladder():
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    assert configure_pooling_for_spyre(model, _SPYRE, max_num_seqs=8) is True
+    assert model.pooler.pooling.batch_ladder == _BATCH_LADDER
+
+
+def test_configure_pooling_without_max_num_seqs_leaves_cls_ladder_empty():
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert model.pooler.pooling.batch_ladder == []
 
 
 def test_spyre_all_pool_handles_a_zero_token_request():
