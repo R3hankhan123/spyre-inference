@@ -739,8 +739,8 @@ def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
 
     Hidden=4096 so torch-spyre can compile FP8 ``_scaled_mm``. Vocab 49216/51200
     hits ``spyre_row_padding`` unpad and SuperDSC N-tiles ``{4096,1024,128}``.
-    Looser than the fp16 LM-head test (atol=1e-1 / rtol=5e-2): both operands
-    quantize to FP8.
+    Tighter than the fp16 LM-head test (atol=1e-1 / rtol=5e-2): both operands
+    quantize to FP8, but logits stay in a small range (weights/acts ``* 0.01``).
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -760,14 +760,27 @@ def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
 
 @pytest.mark.parallel_lm_head
 @pytest.mark.fp8
-def test_fp8_lm_head_apply_3d_matches_reference(tp_group):
-    """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input."""
+@pytest.mark.parametrize(
+    "batch, seq",
+    [
+        (2, 3),  # M=6: M-padded and vocab-padded — reshape used to return garbage
+        (3, 2),  # M=6: same token count, different 3-D layout
+        (2, 4),  # M=8: no M-padding, still vocab-padded
+    ],
+)
+def test_fp8_lm_head_apply_3d_matches_reference(tp_group, batch, seq):
+    """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input.
+
+    Vocab 49216 so ``spyre_row_padding`` is nonzero. ``(2, 3)`` flattens to 6
+    tokens (pad to 8). Reshape must run on the padded-N contiguous buffer;
+    unpadding vocab first leaves a non-contiguous view whose storage Spyre
+    reshape reads as (B, S, vocab). atol matches the 2-D numeric test.
+    """
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     vocab_size = 49216
     embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
-    batch, seq = 2, 4
     layer = _build_fp8_lm_head(vocab_size, embedding_dim, seed=7)
     x = torch.randn(batch, seq, embedding_dim, dtype=torch.float16) * 0.01
     expected = reference_lm_head(x, layer.weight.data)
@@ -777,7 +790,7 @@ def test_fp8_lm_head_apply_3d_matches_reference(tp_group):
 
     assert actual.dtype == torch.float16
     assert actual.shape == (batch, seq, vocab_size)
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.5, rtol=0.2)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":

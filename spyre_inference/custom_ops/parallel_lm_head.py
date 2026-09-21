@@ -137,15 +137,22 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
             for wj, sj in splits:
                 col_outs.append(_fp8_mm(xi, wj, sj, None, per_token=False))
             row_outs.append(_join(col_outs, dim=-1))
-        out = _join(row_outs, dim=0)[:orig_m]
+        out = _join(row_outs, dim=0)
+        if out.shape[0] > orig_m:
+            # Row-slice clone compacting M-pad; column-slice clone does not
+            # (Spyre keeps padded-N storage).
+            out = out[:orig_m].clone()
+
+        # Restore 3-D while N is still the padded GEMM width (contiguous).
+        # Unpadding vocab first makes a non-contiguous view; Spyre reshape
+        # then reads padded-N storage as (B, S, vocab) and (2, 3, K) is garbage.
+        if x.dim() > 2:
+            out = out.reshape(*orig_shape[:-1], out.shape[-1])
 
         padding = cast(int, layer.spyre_row_padding)
         if padding:
-            out = out[:, :-padding]
-
-        if x.dim() > 2:
-            out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out.clone()
+            out = out[..., :-padding]
+        return out
 
 
 def _is_fp8_config(quant_config: object) -> bool:
