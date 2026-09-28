@@ -17,9 +17,13 @@
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
-    - Quantization: Fp8Config auto-selects FP8 LM head via tiled
-      ``aten._scaled_mm``; other configs use the unquantized transposed-weight
-      fast path. Unsupported quantization methods raise NotImplementedError.
+    - Quantization: FP8 models use ``SpyreFp8LMHeadMethod`` (tiled
+      ``aten._scaled_mm``); all others use the unquantized transposed-weight
+      fast path. The FP8 method is installed post-load by
+      ``TorchSpyreModelRunner._initialize_fp8_lm_head``, which detects
+      ``SpyreFp8LinearKernel`` in the body layers — covering both
+      ``Fp8Config`` and ``compressed-tensors`` FP8 models.
+      Unsupported quantization methods raise NotImplementedError.
 """
 
 from typing import cast
@@ -80,20 +84,12 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
 
     N-tiles split the padded vocab into SuperDSC-legal widths
     ``{4096, 1024, 128}``; M-tiles handle the batch dimension.
+    A 3-D ``(B, S, K)`` input is flattened, projected, then reshaped back.
     """
 
     WEIGHT_T_ATTR = "padded_weight_t"
     ROW_ALIGN = 64 * 32
 
-    def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
-        """Pad, transpose, and compute a per-tensor FP8 weight scale."""
-        super().build_weight_t(layer, w)
-        wt = getattr(layer, self.WEIGHT_T_ATTR)
-        amax = wt.data.abs().amax().clamp(min=1e-12)
-        weight_scale = (amax / FP8_E4M3FN_MAX).to(torch.float16).reshape(1)
-        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-
-    @torch._dynamo.disable(recursive=False)
     def apply(
         self,
         layer: torch.nn.Module,
@@ -134,10 +130,12 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
         for mt in m_parts:
             xi = x2d[i : i + mt].clone()
             i += mt
-            col_outs: list[torch.Tensor] = []
-            for wj, sj in splits:
-                col_outs.append(_fp8_mm(xi, wj, sj, None, per_token=False))
-            row_outs.append(_join(col_outs, dim=-1))
+            row_outs.append(
+                _join(
+                    [_fp8_mm(xi, wj, sj, None, per_token=False) for wj, sj in splits],
+                    dim=-1,
+                )
+            )
         out = _join(row_outs, dim=0)
         if out.shape[0] > orig_m:
             # Row-slice: clone() compacts M-pad rows into fresh storage.
@@ -145,10 +143,10 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
 
         padding = cast(int, layer.spyre_row_padding)
         if padding:
-            # Column-slice: clone() does NOT compact on Spyre — the underlying
-            # buffer stays padded_N wide.  Allocate a fresh tensor and copy only
-            # the vocab columns so the subsequent reshape sees a truly
-            # vocab_size-wide (contiguous) buffer.
+            # Column-slice: clone() does not compact on Spyre — the buffer stays
+            # padded_N wide. Copy the vocab columns into a fresh tensor so the
+            # 3-D reshape below sees a vocab-wide buffer. A view whose last
+            # stride is padded_N is read as garbage on D2H.
             vocab_n = n - padding
             compact = torch.empty(out.shape[0], vocab_n, dtype=out.dtype, device=out.device)
             compact.copy_(out[:, :vocab_n])
@@ -160,14 +158,6 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
         return out
 
 
-def _is_fp8_config(quant_config: object) -> bool:
-    """True when the quantization config is ``Fp8Config`` and ``lm_head`` is not ignored."""
-    if quant_config is None or type(quant_config).__name__ != "Fp8Config":
-        return False
-    ignored = getattr(quant_config, "ignored_layers", None) or []
-    return not any("lm_head" in layer for layer in ignored)
-
-
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
     """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device.
@@ -176,7 +166,36 @@ class SpyreParallelLMHead(ParallelLMHead):
     ``SpyreFp8LMHeadMethod.apply`` (FP8), reached via
     ``LogitsProcessor._apply_head`` → ``lm_head.quant_method.apply``. The base
     ``ParallelLMHead.forward`` raises and is unused.
+
+    ``quant_method`` starts as ``SpyreUnquantizedLMHeadMethod`` for all models.
+    ``TorchSpyreModelRunner._initialize_fp8_lm_head`` upgrades it to
+    ``SpyreFp8LMHeadMethod`` post-load when ``SpyreFp8LinearKernel`` is detected
+    in the body layers, covering both ``Fp8Config`` and ``compressed-tensors``
+    FP8 models.
     """
+
+    def initialize_fp8(self) -> None:
+        """Upgrade this layer to FP8 projection post-load.
+
+        Called by ``TorchSpyreModelRunner._initialize_fp8_lm_head`` after weights
+        are on device. ``padded_weight_t`` already exists (built by
+        ``SpyreUnquantizedLMHeadMethod`` during ``process_weights_after_loading``);
+        this method computes ``weight_scale`` from it and swaps in
+        ``SpyreFp8LMHeadMethod``.
+
+        Note: the caller does not consult ``ignored_layers`` / ``ignore`` from the
+        checkpoint quant config before calling this method — the head is always
+        quantized to FP8 for any model where ``SpyreFp8LinearKernel`` is detected
+        in the body layers.  See ``_initialize_fp8_lm_head`` docstring for details.
+        """
+        method = SpyreFp8LMHeadMethod()
+        wt = getattr(self, method.WEIGHT_T_ATTR)
+        amax = wt.data.abs().amax().clamp(min=1e-12)
+        self.weight_scale = Parameter(
+            (amax / FP8_E4M3FN_MAX).to(torch.float16).reshape(1),
+            requires_grad=False,
+        )
+        self.quant_method = method
 
     def _apply(self, fn, recurse=True):
         # The GEMM reads `padded_weight_t`; once it exists `weight` is runtime-dead, so
@@ -196,16 +215,12 @@ class SpyreParallelLMHead(ParallelLMHead):
         kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
 
-        # Only UnquantizedEmbeddingMethod supported. Fp8Config resolves to it;
-        # other quantization methods are rejected.
+        # Only UnquantizedEmbeddingMethod is supported at construction time.
+        # _initialize_fp8_lm_head may upgrade this to SpyreFp8LMHeadMethod post-load.
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
                 f"SpyreParallelLMHead does not support {type(self.quant_method).__name__}."
             )
 
-        if _is_fp8_config(self.quant_config):
-            logger.debug("Building SpyreParallelLMHead with FP8 (TP size %d)", self.tp_size)
-            self.quant_method = SpyreFp8LMHeadMethod()
-        else:
-            logger.debug("Building SpyreParallelLMHead with TP size %d", self.tp_size)
-            self.quant_method = SpyreUnquantizedLMHeadMethod()
+        logger.debug("Building SpyreParallelLMHead with TP size %d", self.tp_size)
+        self.quant_method = SpyreUnquantizedLMHeadMethod()
