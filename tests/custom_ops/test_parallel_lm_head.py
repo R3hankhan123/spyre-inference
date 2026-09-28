@@ -774,9 +774,11 @@ def test_fp8_lm_head_apply_3d_matches_reference(tp_group, batch, seq):
     """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input.
 
     Vocab 49216 so ``spyre_row_padding`` is nonzero. ``(2, 3)`` flattens to 6
-    tokens (pad to 8). Reshape must run on the padded-N contiguous buffer;
-    unpadding vocab first leaves a non-contiguous view whose storage Spyre
-    reshape reads as (B, S, vocab). atol matches the 2-D numeric test.
+    tokens (M-padded to 8). The fix strips vocab padding on the compact 2-D
+    buffer and then reshapes: if vocab-unpad runs after the 3-D reshape it
+    produces a non-contiguous ``(B, S, vocab)`` view whose stride in the last
+    dim is ``padded_N``, and Spyre's D2H transfer misreads the underlying
+    ``padded_N``-wide storage as garbage. atol matches the 2-D numeric test.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
