@@ -33,17 +33,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .lazy_compile import CompileOutermost, maybe_compile
 from .fp8_linear_kernel import (
     FP8_E4M3FN_MAX,
     _fp8_mm,
     _join,
     _m_tiles,
-    _n_tiles,
-    _n_weight_splits,
     _pad_m,
+    _qfp8wt_splits,
 )
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 from .linear import SpyreTransposedWeightMethod
 
 logger = init_logger(__name__)
@@ -76,9 +74,9 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
     """FP8 LM-head projection via tiled ``aten._scaled_mm``.
 
     The padded transposed weight ``[K, N]`` = ``[hidden_dim, padded_vocab]``
-    is stored FP16 (online quantization): the compiled ``_scaled_mm`` graph
-    re-quantizes both activation and weight to FP8 every forward call, matching
-    the body ``SpyreFp8LinearKernel`` pattern.
+    is stored FP16 and eager-quantized to QFP8WT tiles on first forward (via
+    ``_qfp8wt_splits``), matching the ``SpyreFp8LinearKernel`` body pattern.
+    The compiled ``_scaled_mm`` graph quantizes only the activation per call.
 
     N-tiles split the padded vocab into SuperDSC-legal widths
     ``{4096, 1024, 128}``; M-tiles handle the batch dimension.
@@ -112,11 +110,13 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
         orig_m = x2d.shape[0]
         k, n = int(w.shape[0]), int(w.shape[1])
 
-        # Rebuild cached weight splits when stale (first call or after device move).
-        splits = getattr(layer, "_fp8_n_weight_splits", None)
+        # Eager-quantize weight tiles to QFP8WT on first call or after device
+        # move. _n_weight_splits returns FP16 slices; _scaled_mm requires FP8
+        # for mat2, so we must use _qfp8wt_splits (as SpyreFp8LinearKernel does).
+        splits = getattr(layer, "_fp8_qfp8wt_splits", None)
         if splits is None or splits[0][0].device != w.device:
-            splits = _n_weight_splits(w, cast(torch.Tensor, layer.weight_scale), _n_tiles(n))
-            layer._fp8_n_weight_splits = splits
+            splits = _qfp8wt_splits(w, cast(torch.Tensor, layer.weight_scale), w.device)
+            layer._fp8_qfp8wt_splits = splits
 
         # Cache m_parts: k and n are fixed; only orig_m varies between calls.
         # Decode overwhelmingly sends the same orig_m (typically 1) every step.
@@ -140,19 +140,23 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
             row_outs.append(_join(col_outs, dim=-1))
         out = _join(row_outs, dim=0)
         if out.shape[0] > orig_m:
-            # Row-slice clone compacting M-pad; column-slice clone does not
-            # (Spyre keeps padded-N storage).
+            # Row-slice: clone() compacts M-pad rows into fresh storage.
             out = out[:orig_m].clone()
-
-        # Restore 3-D while N is still the padded GEMM width (contiguous).
-        # Unpadding vocab first makes a non-contiguous view; Spyre reshape
-        # then reads padded-N storage as (B, S, vocab) and (2, 3, K) is garbage.
-        if x.dim() > 2:
-            out = out.reshape(*orig_shape[:-1], out.shape[-1])
 
         padding = cast(int, layer.spyre_row_padding)
         if padding:
-            out = out[..., :-padding]
+            # Column-slice: clone() does NOT compact on Spyre — the underlying
+            # buffer stays padded_N wide.  Allocate a fresh tensor and copy only
+            # the vocab columns so the subsequent reshape sees a truly
+            # vocab_size-wide (contiguous) buffer.
+            vocab_n = n - padding
+            compact = torch.empty(out.shape[0], vocab_n, dtype=out.dtype, device=out.device)
+            compact.copy_(out[:, :vocab_n])
+            out = compact
+
+        if x.dim() > 2:
+            out = out.reshape(*orig_shape[:-1], out.shape[-1])
+
         return out
 
 
