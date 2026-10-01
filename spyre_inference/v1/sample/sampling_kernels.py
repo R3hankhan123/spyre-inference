@@ -20,6 +20,6 @@ import torch
 
 # x86 ships an AVX512 build and an AVX2 fallback, as vLLM's CPU backend does.
 if platform.machine() == "x86_64" and not torch.cpu._is_avx512_supported():
-    import spyre_inference._C_AVX2  # noqa: F401
+    import spyre_inference._C_AVX2  # noqa: F401  # ty: ignore[unresolved-import]
 else:
-    import spyre_inference._C  # noqa: F401
+    import spyre_inference._C  # noqa: F401  # ty: ignore[unresolved-import]

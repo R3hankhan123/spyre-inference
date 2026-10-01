@@ -17,6 +17,7 @@
 
 #include "cpu_types.hpp"
 
+#include <torch/all.h>
 #include <torch/library.h>
 
 #include <cmath>
