@@ -33,4 +33,4 @@ class SpyreSampler(Sampler):
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
-        return torch.ops._spyre_C.greedy_argmax(logits)
+        return torch.ops._spyre_C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]

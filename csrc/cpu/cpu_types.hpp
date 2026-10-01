@@ -16,8 +16,8 @@
 // Copyright contributors to the vLLM project, Apache-2.0.
 
 // Vendored from vLLM csrc/cpu/cpu_types.hpp, trimmed to the ISAs spyre-inference
-// ships on. The per-ISA headers are verbatim copies below their license header;
-// resync them on a vLLM bump.
+// ships on. The per-ISA headers keep only FP32Vec8 and FP32Vec16, the types the
+// sampling kernels use; each kept line is unchanged from vLLM.
 #ifndef CPU_TYPES_HPP
 #define CPU_TYPES_HPP
 
