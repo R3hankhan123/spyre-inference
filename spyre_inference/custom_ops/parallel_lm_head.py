@@ -84,7 +84,6 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
 
     N-tiles split the padded vocab into SuperDSC-legal widths
     ``{4096, 1024, 128}``; M-tiles handle the batch dimension.
-    A 3-D ``(B, S, K)`` input is flattened, projected, then reshaped back.
     """
 
     WEIGHT_T_ATTR = "padded_weight_t"
@@ -101,9 +100,12 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
         if bias is not None:
             raise NotImplementedError("SpyreFp8LMHeadMethod does not yet support embedding_bias.")
 
-        orig_shape = x.shape
-        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-        orig_m = x2d.shape[0]
+        if x.dim() > 2:
+            raise NotImplementedError(
+                f"SpyreFp8LMHeadMethod requires 2-D input, got x.shape={tuple(x.shape)}."
+            )
+
+        orig_m = x.shape[0]
         k, n = int(w.shape[0]), int(w.shape[1])
 
         # Eager-quantize weight tiles to QFP8WT on first call or after device
@@ -123,7 +125,7 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
         else:
             m_parts = cached[1]
 
-        x2d = _pad_m(x2d, sum(m_parts))
+        x2d = _pad_m(x, sum(m_parts))
 
         row_outs: list[torch.Tensor] = []
         i = 0
@@ -143,18 +145,7 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
 
         padding = cast(int, layer.spyre_row_padding)
         if padding:
-            # Column-slice: clone() does not compact on Spyre — the buffer stays
-            # padded_N wide. Copy the vocab columns into a fresh tensor so the
-            # 3-D reshape below sees a vocab-wide buffer. A view whose last
-            # stride is padded_N is read as garbage on D2H.
-            vocab_n = n - padding
-            compact = torch.empty(out.shape[0], vocab_n, dtype=out.dtype, device=out.device)
-            compact.copy_(out[:, :vocab_n])
-            out = compact
-
-        if x.dim() > 2:
-            out = out.reshape(*orig_shape[:-1], out.shape[-1])
-
+            out = out[:, :-padding]
         return out
 
 

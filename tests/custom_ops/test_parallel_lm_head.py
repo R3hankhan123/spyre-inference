@@ -790,37 +790,16 @@ def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
 
 @pytest.mark.parallel_lm_head
 @pytest.mark.fp8
-@pytest.mark.parametrize(
-    "batch, seq",
-    [
-        (2, 3),  # M=6: M-padded and vocab-padded — reshape used to return garbage
-        (3, 2),  # M=6: same token count, different 3-D layout
-        (2, 4),  # M=8: no M-padding, still vocab-padded
-    ],
-)
-def test_fp8_lm_head_apply_3d_matches_reference(tp_group, batch, seq):
-    """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input.
+def test_fp8_lm_head_apply_rejects_3d(tp_group):
+    """3-D input is rejected with NotImplementedError.
 
-    Vocab 49216 so ``spyre_row_padding`` is nonzero. ``(2, 3)`` flattens to 6
-    tokens (M-padded to 8). Vocab padding is copied into a compact 2-D buffer
-    before the reshape: a column-slice view keeps stride ``padded_N``, and
-    Spyre's D2H then reads that storage as garbage.
+    Column-slice of an ``aten._scaled_mm`` output followed by ``reshape`` reads
+    garbage on Spyre (torch-spyre bug — the 3-D branch is unreachable in serving).
     """
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    vocab_size = 49216
-    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
-    layer = _build_fp8_lm_head(vocab_size, embedding_dim, seed=7)
-    x = torch.randn(batch, seq, embedding_dim, dtype=torch.float16) * 0.01
-    expected = reference_lm_head(x, layer.weight.data)
-
-    layer = layer.to("spyre")
-    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
-
-    assert actual.dtype == torch.float16
-    assert actual.shape == (batch, seq, vocab_size)
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
+    layer = _build_fp8_lm_head(49216, _FP8_LM_HEAD_HIDDEN_MM)
+    x = torch.randn(2, 3, _FP8_LM_HEAD_HIDDEN_MM, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="2-D"):
+        layer.quant_method.apply(layer, x)
 
 
 if __name__ == "__main__":
