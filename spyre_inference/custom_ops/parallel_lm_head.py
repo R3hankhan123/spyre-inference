@@ -47,6 +47,7 @@ from .fp8_linear_kernel import (
 )
 from .lazy_compile import CompileOutermost, maybe_compile
 from .linear import SpyreTransposedWeightMethod
+from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -102,7 +103,13 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
             raise NotImplementedError("SpyreFp8LMHeadMethod does not yet support embedding_bias.")
 
         orig_shape = x.shape
-        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        # Flatten a 3-D activation on the host. A device reshape is a view that
+        # keeps the 3-D stick layout, and the tiled GEMM would read it as 2-D.
+        if x.dim() > 2:
+            cpu_x = convert(x, device="cpu").reshape(-1, x.shape[-1])
+            x2d = convert(cpu_x, device=x.device)
+        else:
+            x2d = x
         orig_m = x2d.shape[0]
         k, n = int(w.shape[0]), int(w.shape[1])
 
@@ -141,20 +148,20 @@ class SpyreFp8LMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMeth
             # Row-slice: clone() compacts M-pad rows into fresh storage.
             out = out[:orig_m].clone()
 
+        if x.dim() > 2:
+            # Unpad and reshape on the host. On device, a column slice keeps the
+            # padded-N stick allocation, and reshape then reads that width as
+            # (B, S, vocab) — (2, 3) over a padded vocab comes back scrambled.
+            cpu_out = convert(out, device="cpu")
+            padding = cast(int, layer.spyre_row_padding)
+            if padding:
+                cpu_out = cpu_out[:, :-padding]
+            cpu_out = cpu_out.reshape(*orig_shape[:-1], cpu_out.shape[-1])
+            return convert(cpu_out, device=x.device)
+
         padding = cast(int, layer.spyre_row_padding)
         if padding:
-            # Column-slice: clone() does not compact on Spyre — the buffer stays
-            # padded_N wide. Copy the vocab columns into a fresh tensor so the
-            # 3-D reshape below sees a vocab-wide buffer. A view whose last
-            # stride is padded_N is read as garbage on D2H.
-            vocab_n = n - padding
-            compact = torch.empty(out.shape[0], vocab_n, dtype=out.dtype, device=out.device)
-            compact.copy_(out[:, :vocab_n])
-            out = compact
-
-        if x.dim() > 2:
-            out = out.reshape(*orig_shape[:-1], out.shape[-1])
-
+            out = out[:, :-padding]
         return out
 
 

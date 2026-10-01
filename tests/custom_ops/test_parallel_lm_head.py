@@ -802,9 +802,9 @@ def test_fp8_lm_head_apply_3d_matches_reference(tp_group, batch, seq):
     """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input.
 
     Vocab 49216 so ``spyre_row_padding`` is nonzero. ``(2, 3)`` flattens to 6
-    tokens (M-padded to 8). Vocab padding is copied into a compact 2-D buffer
-    before the reshape: a column-slice view keeps stride ``padded_N``, and
-    Spyre's D2H then reads that storage as garbage.
+    tokens (M-padded to 8). The unpad and reshape run on the host: an on-device
+    column slice keeps the padded vocab width, and reshape reads that storage
+    as ``(B, S, vocab)``.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
