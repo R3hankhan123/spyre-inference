@@ -93,7 +93,10 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             for i, generator in generators.items():
                 seeds[i] = torch.randint(0, 2**31, (1,), generator=generator)
             return (
-                torch.ops._spyre_C.fused_gumbel_argmax(logits.float(), seeds),
+                torch.ops._spyre_C.fused_gumbel_argmax(
+                    logits.float(),  # ty: ignore[invalid-argument-type]
+                    seeds,  # ty: ignore[invalid-argument-type]
+                ),
                 logits_to_return,
             )
         q = torch.empty(logits.shape, dtype=torch.float64, device=logits.device)
