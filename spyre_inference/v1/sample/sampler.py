@@ -13,26 +13,24 @@
 # limitations under the License.
 
 import torch
-from vllm.config.model import LogprobsMode
 from vllm.v1.sample.sampler import Sampler
 
-from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
+from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 
-class SpyreSampler(Sampler):
-    """Upstream Sampler with host-side greedy and random draws.
+def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    if not has_sampling_kernels():
+        return Sampler.greedy_sample(logits)
+    return torch.ops._spyre_C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]
+
+
+def install_spyre_sampler(sampler: Sampler) -> None:
+    """Points upstream's Sampler at the host-side draws, in place, so every holder
+    of it (e.g. RejectionSampler) samples the same way.
 
     Spyre D2Hs logits before sampling, so both draws run on the host: greedy
     rows through the parallel argmax kernel, random rows through
     SpyreTopKTopPSampler."""
-
-    def __init__(self, logprobs_mode: LogprobsMode, use_fp64_gumbel: bool) -> None:
-        super().__init__(logprobs_mode, use_fp64_gumbel)
-        self.topk_topp_sampler = SpyreTopKTopPSampler(logprobs_mode, use_fp64_gumbel)
-
-    @staticmethod
-    def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
-        if not use_sampling_kernels():
-            return Sampler.greedy_sample(logits)
-        return torch.ops._spyre_C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]
+    sampler.topk_topp_sampler = SpyreTopKTopPSampler(sampler.logprobs_mode, sampler.use_fp64_gumbel)
+    sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]

@@ -91,7 +91,7 @@ def test_topk_topp_sort_free_matches_full_sort(rows: int, vocab: int, ties: str)
 # The override applies top-k up front and delegates the rest upstream, so it must
 # stay token-for-token identical to the stock joint sort. Both cases exercise the
 # override's top-k pre-filter (top-p-only would delegate to super unchanged).
-# fp64 Gumbel keeps fresh noise on both sides; the fused kernel's table draw is
+# fp64 Gumbel keeps fresh noise on both sides; the fused kernel's hashed draw is
 # covered in test_sampling_kernels.
 @pytest.mark.parametrize("k,p", [(50, None), (50, 0.8)], ids=["topk", "topk_topp"])
 @pytest.mark.parametrize("rows", [1, 8])
@@ -100,7 +100,10 @@ def test_swapped_sampler_matches_stock_tokens(
     rows: int, vocab: int, k: int | None, p: float | None
 ) -> None:
     meta = _meta(rows, k=k, p=p)
-    logits = torch.randn(rows, vocab, dtype=torch.float16)
+    # fp32 so no logits tie: on a tie straddling the top-p cutoff, which tied
+    # token survives is arbitrary (see test_topk_topp_sort_free_matches_full_sort).
+    torch.manual_seed(rows + vocab)
+    logits = torch.randn(rows, vocab, dtype=torch.float32)
 
     stock = Sampler(use_fp64_gumbel=True)
     torch.manual_seed(1234)
@@ -132,11 +135,11 @@ def test_log_space_gumbel_matches_softmax_draw(rows: int) -> None:
 
 
 def test_runner_installs_spyre_topk_sampler() -> None:
-    """The runner's __init__ installs SpyreSampler -- guards the swap itself."""
+    """The runner's __init__ patches upstream's Sampler in place."""
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
-    from spyre_inference.v1.sample.sampler import SpyreSampler
+    from spyre_inference.v1.sample.sampler import greedy_sample
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
     vllm_config = VllmConfig(
@@ -150,5 +153,5 @@ def test_runner_installs_spyre_topk_sampler() -> None:
         compilation_config=CompilationConfig(custom_ops=["all"]),
     )
     runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
-    assert type(runner.sampler) is SpyreSampler
+    assert runner.sampler.greedy_sample is greedy_sample
     assert type(runner.sampler.topk_topp_sampler) is SpyreTopKTopPSampler

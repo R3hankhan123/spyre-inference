@@ -113,7 +113,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     _mean_pool_grid_reduce,
     _mean_pool_row_mask_mul,
 )
-from spyre_inference.v1.sample.sampler import SpyreSampler
+from spyre_inference.v1.sample.sampler import install_spyre_sampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -606,14 +606,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # via self._spyre_device regardless of self.device.
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, torch.device("cpu"))
+        install_spyre_sampler(self.sampler)
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
-
-        self.sampler = SpyreSampler(self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel)
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False

@@ -18,15 +18,15 @@ import pytest
 import torch
 
 from spyre_inference.v1.sample import sampler, topk_topp_sampler
-from spyre_inference.v1.sample.sampler import SpyreSampler
-from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
+from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 
 @pytest.fixture(autouse=True)
 def _load_kernels() -> None:
     # Fail rather than silently test the fallback when the extension is not built.
-    assert use_sampling_kernels(), "csrc/ sampling kernels are not built"
+    assert has_sampling_kernels(), "csrc/ sampling kernels are not built"
 
 
 # Vocabs off a SIMD-width multiple exercise the kernels' remainder handling.
@@ -47,6 +47,24 @@ def test_gumbel_matches_softmax_distribution() -> None:
     out = torch.ops._spyre_C.fused_gumbel_argmax(logp.expand(draws, vocab), seeds)
     freq = torch.bincount(out, minlength=vocab).float() / draws
     assert (freq - logp.exp()).abs().max() < 0.01
+
+
+def test_gumbel_reaches_large_vocab_tail() -> None:
+    # A shared noise table limits each row to 2^20 noise windows, which makes
+    # much of a large vocab unreachable and under-samples the tail.
+    vocab, draws, chunk = 151_936, 8192, 256
+    row = -1.1 * torch.log(torch.arange(1, vocab + 1, dtype=torch.float64))  # Zipf(1.1)
+    p = torch.softmax(row, dim=-1)
+    tail = p < 2.0**-20
+    gen = torch.Generator().manual_seed(0)
+    hits = 0
+    for _ in range(draws // chunk):
+        seeds = torch.randint(0, 2**62, (chunk,), dtype=torch.long, generator=gen)
+        logits = row.float().expand(chunk, vocab).contiguous()
+        hits += int(tail[torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds)].sum())
+    expected = float(p[tail].sum())
+    sigma = (expected * (1 - expected) / draws) ** 0.5
+    assert abs(hits / draws - expected) < 4 * sigma
 
 
 def test_gumbel_never_picks_masked_tokens() -> None:
@@ -70,15 +88,42 @@ def test_seeded_requests_are_reproducible() -> None:
 
 def test_spyre_sampler_greedy_matches_stock() -> None:
     logits = torch.randn(8, 32000)
-    assert torch.equal(SpyreSampler.greedy_sample(logits), logits.argmax(dim=-1))
+    assert torch.equal(greedy_sample(logits), logits.argmax(dim=-1))
 
 
 def test_falls_back_to_torch_without_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sampler, "use_sampling_kernels", lambda: False)
-    monkeypatch.setattr(topk_topp_sampler, "use_sampling_kernels", lambda: False)
+    monkeypatch.setattr(sampler, "has_sampling_kernels", lambda: False)
+    monkeypatch.setattr(topk_topp_sampler, "has_sampling_kernels", lambda: False)
     logits = torch.randn(4, 32000)
-    assert torch.equal(SpyreSampler.greedy_sample(logits), logits.argmax(dim=-1))
+    assert torch.equal(greedy_sample(logits), logits.argmax(dim=-1))
     k = torch.full((4,), 5)
     topk = SpyreTopKTopPSampler("raw_logprobs", False)
     out = topk.forward_native(logits.clone(), {}, k, None)[0]
     assert (out.unsqueeze(1) == logits.topk(5).indices).any(dim=1).all()
+
+
+def test_gumbel_strided_seeds_match_contiguous() -> None:
+    logits = torch.randn(8, 32000)
+    seeds = torch.randint(0, 2**31, (16,), dtype=torch.long)[::2]
+    assert not seeds.is_contiguous()
+    assert torch.equal(
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds),
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.contiguous()),
+    )
+    with pytest.raises(RuntimeError, match="seeds must be int64"):
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.int())
+
+
+def test_greedy_nan_matches_argmax() -> None:
+    # torch.argmax treats NaN as the maximum and returns the first one.
+    vocab = 32003  # off a SIMD-width multiple, so the last NaN lands in the scalar tail
+    x = torch.randn(6, vocab)
+    x[0, 100] = float("nan")  # before the real max
+    x[0, 200] = 50.0
+    x[1, 200] = 50.0
+    x[1, 300] = float("nan")  # after the real max
+    x[2, [7, 9000]] = float("nan")
+    x[3, vocab - 1] = float("nan")
+    x[4, 10] = float("inf")
+    x[4, 20] = float("-inf")  # inf + -inf: NaN sum without a NaN logit
+    assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))

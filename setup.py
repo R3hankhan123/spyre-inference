@@ -36,6 +36,23 @@ class CMakeExtension(Extension):
 
 class cmake_build_ext(build_ext):
     def build_extensions(self) -> None:
+        # The kernels are optional: without them the samplers fall back to
+        # PyTorch ops, so a failed build must not fail the install.
+        try:
+            self._build_with_cmake()
+        except (OSError, subprocess.CalledProcessError) as e:
+            cmake_failed = isinstance(e, subprocess.CalledProcessError)
+            why = "see the CMake output above" if cmake_failed else e
+            print(
+                f"WARNING: spyre-inference sampling kernels failed to build ({why}). "
+                "Installing without them: host sampling falls back to PyTorch ops "
+                "and gets no kernel speedup.",
+                file=sys.stderr,
+            )
+            # setuptools copies and lists outputs from this list; nothing was built.
+            self.extensions = []
+
+    def _build_with_cmake(self) -> None:
         build_temp = Path(self.build_temp).resolve()
         build_temp.mkdir(parents=True, exist_ok=True)
 

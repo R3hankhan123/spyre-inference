@@ -486,17 +486,22 @@ fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts t
 for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
 large share of each decode step.
 
-`SpyreModelRunner` replaces the sampler with `SpyreSampler` (`v1/sample/sampler.py`),
-which brings back the CPU kernels and drops the full-vocabulary sort:
+`SpyreModelRunner` patches upstream's `Sampler` in place (`install_spyre_sampler` in
+`v1/sample/sampler.py`), so every holder of it, the rejection sampler included, samples the
+same way. That brings back the CPU kernels and drops the full-vocabulary sort:
 
 - **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
-  `torch.ops._spyre_C.fused_gumbel_argmax`: one SIMD pass of `argmax(logits + g)`, with the
-  Gumbel noise `g` read from a fixed 2^20-entry table at a per-row random offset. Adding the
-  same constant to every logit cannot change the argmax, so the draw needs no softmax, no
-  per-element RNG, and no noise tensor. A seeded request draws its row offset from its own
-  `torch.Generator`, so it stays reproducible. `use_fp64_gumbel` keeps fresh fp64 noise,
-  drawn in log space (`argmax(x - log q)`, `q ~ Exp(1)`).
-- **Greedy** — `SpyreSampler.greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
+  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
+  Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
+  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
+  running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
+  others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
+  seeded request draws its row seed from its own `torch.Generator`, so it stays
+  reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
+  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
+  table instead, which limits each row to 2^20 noise windows and leaves much of a large
+  vocabulary unreachable.
+- **Greedy** — `greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
   vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
   scan.
@@ -511,9 +516,10 @@ so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) an
 AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
 supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
-cannot collide with a vLLM `_C` in the same environment. `SPYRE_SAMPLING_KERNELS=0` turns the
-kernels off, and an unbuilt extension (common in a dev checkout) warns once; either way the
-samplers fall back to `torch.argmax` and a fresh-noise log-space draw. Because the sampler reimplements
+cannot collide with a vLLM `_C` in the same environment. If the extension
+is missing or fails to import (a failed build, or a dev checkout that never built it), the
+import logs a warning and the samplers fall back to `torch.argmax` and a fresh-noise
+log-space draw. Because the sampler reimplements
 the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
 bump.
 

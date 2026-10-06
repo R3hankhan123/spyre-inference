@@ -18,7 +18,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
-from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
+from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 
 
 def apply_top_k_top_p_sort_free(
@@ -58,9 +58,9 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
     combined with top-k skips the sort too (``apply_top_k_top_p_sort_free``);
     top-p alone sorts.
 
-    The draw runs in vLLM's fused Gumbel-max kernel, reading its noise from a
-    fixed 2^20-entry table at a per-row random offset rather than generating a
-    fresh ``[B, V]`` noise tensor. That draw is why ``forward_native``
+    The draw runs in a fused Gumbel-max kernel that hashes its noise per element
+    from a per-row seed rather than materializing a ``[B, V]`` noise tensor.
+    That draw is why ``forward_native``
     reimplements upstream's tail rather than delegating to ``super()`` (which
     would softmax + ``random_sample``). ``use_fp64_gumbel`` keeps fresh fp64
     noise, drawn in log space: ``argmax(softmax(x)/q) == argmax(x - log q)`` for
@@ -85,12 +85,12 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        if not self.use_fp64_gumbel and use_sampling_kernels():
-            # Per-row seeds offset into a precomputed Gumbel table, so the draw
-            # is one pass with no noise tensor; seeded requests stay reproducible.
-            seeds = torch.randint(0, 2**31, (logits.shape[0],), dtype=torch.long)
+        if not self.use_fp64_gumbel and has_sampling_kernels():
+            # Per-row seeds key the kernel's noise, so the draw is one pass with
+            # no noise tensor; seeded requests stay reproducible.
+            seeds = torch.randint(0, 2**62, (logits.shape[0],), dtype=torch.long)
             for i, generator in generators.items():
-                seeds[i] = torch.randint(0, 2**31, (1,), generator=generator)
+                seeds[i] = torch.randint(0, 2**62, (1,), generator=generator)
             return (
                 torch.ops._spyre_C.fused_gumbel_argmax(
                     logits.float(),  # ty: ignore[invalid-argument-type]

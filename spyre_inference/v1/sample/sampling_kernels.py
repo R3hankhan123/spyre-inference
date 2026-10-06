@@ -14,34 +14,27 @@
 
 """Loads the host sampling kernels built from csrc/ (``torch.ops._spyre_C``)."""
 
-import functools
 import platform
 
 import torch
 from vllm.logger import init_logger
 
-from spyre_inference import envs
+try:
+    # x86 ships an AVX512 build and an AVX2 fallback, as vLLM's CPU backend does.
+    if platform.machine() == "x86_64" and not torch.cpu._is_avx512_supported():
+        import spyre_inference._C_AVX2  # noqa: F401  # ty: ignore[unresolved-import]
+    else:
+        import spyre_inference._C  # noqa: F401  # ty: ignore[unresolved-import]
+    _HAS_SAMPLING_KERNELS = True
+except ImportError as e:
+    _HAS_SAMPLING_KERNELS = False
+    init_logger(__name__).warning(
+        "Failed to import the sampling kernels extension (spyre_inference._C): %s. "
+        "Falling back to PyTorch sampling, which is slower.",
+        e,
+    )
 
-logger = init_logger(__name__)
 
-
-@functools.cache
-def use_sampling_kernels() -> bool:
-    """Loads the kernels on first use; False under ``SPYRE_SAMPLING_KERNELS=0`` or
-    when the extension is not built, so the samplers fall back to PyTorch ops."""
-    if not envs.SPYRE_SAMPLING_KERNELS:
-        return False
-    try:
-        # x86 ships an AVX512 build and an AVX2 fallback, as vLLM's CPU backend does.
-        if platform.machine() == "x86_64" and not torch.cpu._is_avx512_supported():
-            import spyre_inference._C_AVX2  # noqa: F401  # ty: ignore[unresolved-import]
-        else:
-            import spyre_inference._C  # noqa: F401  # ty: ignore[unresolved-import]
-    except ImportError as e:
-        logger.warning_once(
-            "Sampling kernels not built (%s); falling back to PyTorch sampling. "
-            "Run `uv sync` to build them, or set SPYRE_SAMPLING_KERNELS=0.",
-            e,
-        )
-        return False
-    return True
+def has_sampling_kernels() -> bool:
+    """Whether the csrc/ sampling kernels are built and loaded."""
+    return _HAS_SAMPLING_KERNELS
