@@ -50,7 +50,6 @@ endfunction()
 
 find_isa(${CPUINFO} "Power11" POWER11_FOUND)
 find_isa(${CPUINFO} "POWER10" POWER10_FOUND)
-find_isa(${CPUINFO} "POWER9" POWER9_FOUND)
 find_isa(${CPUINFO} "S390" S390_FOUND)
 
 set(SPYRE_EXT_SRC
@@ -86,14 +85,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
   return()
 endif()
 
-if (POWER9_FOUND)
-  list(APPEND CXX_COMPILE_FLAGS "-mvsx" "-mcpu=power9" "-mtune=power9")
-elseif (POWER10_FOUND OR POWER11_FOUND)
+if (POWER10_FOUND OR POWER11_FOUND)
   list(APPEND CXX_COMPILE_FLAGS "-mvsx" "-mcpu=power10" "-mtune=power10")
 elseif (S390_FOUND)
-  list(APPEND CXX_COMPILE_FLAGS "-mvx" "-mzvector" "-march=native" "-mtune=native")
+  list(APPEND CXX_COMPILE_FLAGS "-mvx" "-mzvector" "-march=z15" "-mtune=z15")
 else()
-  message(FATAL_ERROR "spyre-inference CPU kernels require x86_64, Power9+ or s390x.")
+  message(FATAL_ERROR "spyre-inference CPU kernels require x86_64, Power10+ or s390x.")
 endif()
 
 define_extension_target(

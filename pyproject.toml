@@ -79,7 +79,6 @@ cache-keys = [
     { file = "csrc/**/*.cpp" },
     { file = "csrc/**/*.hpp" },
     { file = "csrc/**/*.h" },
-    { git = { commit = true } },
 ]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs

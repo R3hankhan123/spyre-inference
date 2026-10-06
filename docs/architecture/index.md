@@ -511,7 +511,9 @@ so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) an
 AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
 supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
-cannot collide with a vLLM `_C` in the same environment. Because the sampler reimplements
+cannot collide with a vLLM `_C` in the same environment. `SPYRE_SAMPLING_KERNELS=0` turns the
+kernels off, and an unbuilt extension (common in a dev checkout) warns once; either way the
+samplers fall back to `torch.argmax` and a fresh-noise log-space draw. Because the sampler reimplements
 the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
 bump.
 

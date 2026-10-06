@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
     SPYRE_NUM_CPUS: int = 0
+    SPYRE_SAMPLING_KERNELS: bool = True
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
 _cache: dict[str, Any] = {}
@@ -120,6 +121,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),
+    # When "1" (default), sample on the host with the C++ kernels built from csrc/,
+    # falling back to PyTorch ops with a warning if they are not built. "0" always
+    # uses the PyTorch ops.
+    "SPYRE_SAMPLING_KERNELS": lambda: bool(int(os.getenv("SPYRE_SAMPLING_KERNELS", "1"))),
     # When "1" (default), clamp the CPU threading env vars (OMP_NUM_THREADS and
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.

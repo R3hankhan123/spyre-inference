@@ -17,8 +17,16 @@
 import pytest
 import torch
 
+from spyre_inference.v1.sample import sampler, topk_topp_sampler
 from spyre_inference.v1.sample.sampler import SpyreSampler
+from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+
+
+@pytest.fixture(autouse=True)
+def _load_kernels() -> None:
+    # Fail rather than silently test the fallback when the extension is not built.
+    assert use_sampling_kernels(), "csrc/ sampling kernels are not built"
 
 
 # Vocabs off a SIMD-width multiple exercise the kernels' remainder handling.
@@ -63,3 +71,14 @@ def test_seeded_requests_are_reproducible() -> None:
 def test_spyre_sampler_greedy_matches_stock() -> None:
     logits = torch.randn(8, 32000)
     assert torch.equal(SpyreSampler.greedy_sample(logits), logits.argmax(dim=-1))
+
+
+def test_falls_back_to_torch_without_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sampler, "use_sampling_kernels", lambda: False)
+    monkeypatch.setattr(topk_topp_sampler, "use_sampling_kernels", lambda: False)
+    logits = torch.randn(4, 32000)
+    assert torch.equal(SpyreSampler.greedy_sample(logits), logits.argmax(dim=-1))
+    k = torch.full((4,), 5)
+    topk = SpyreTopKTopPSampler("raw_logprobs", False)
+    out = topk.forward_native(logits.clone(), {}, k, None)[0]
+    assert (out.unsqueeze(1) == logits.topk(5).indices).any(dim=1).all()
