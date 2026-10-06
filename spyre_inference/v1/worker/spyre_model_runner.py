@@ -744,6 +744,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Before any trace: resolved lazily inside the block graph, the scales become
+        # a guard on their unset value and the first real prefill recompiles the block.
+        for module in self.model.modules():
+            impl = getattr(module, "impl", None)
+            if isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl):
+                impl.prepare_kv_scales(module)
+
         # Before the device move: the FP8 head is DMA'd as QFP8WT, which `.to` then skips.
         from spyre_inference.custom_ops.parallel_lm_head import install_fp8_lm_head
 
