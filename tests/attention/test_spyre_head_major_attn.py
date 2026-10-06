@@ -104,6 +104,7 @@ def _fresh_pages(
     block_size: int,
     head_size: int,
     device: torch.device,
+    fp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Zeroed head-major pages, through the impl so they carry the production layout.
 
@@ -112,12 +113,14 @@ def _fresh_pages(
     """
     if device.type != "spyre":
         shape = (num_blocks, num_kv_heads, block_size, head_size)
-        return torch.zeros(shape, dtype=DTYPE), torch.zeros(shape, dtype=DTYPE)
+        dtype = torch.float8_e4m3fn if fp8 else DTYPE
+        return torch.zeros(shape, dtype=dtype), torch.zeros(shape, dtype=dtype)
     spec = AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        dtype=DTYPE,
+        # Upstream's spec dtype for an fp8 cache.
+        dtype=torch.uint8 if fp8 else DTYPE,
     )
     cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, device)
     return cache.k_pages, cache.v_pages
@@ -138,6 +141,7 @@ def _run_head_major_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    kv_cache_dtype: str = "auto",
 ) -> None:
     """Validate against the same CPU reference the token-major suite uses.
 
@@ -236,13 +240,16 @@ def _run_head_major_attn_test(
         num_kv_heads=num_kv_heads,
         alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=kv_cache_dtype,
         logits_soft_cap=soft_cap,
     )
     assert attn_impl.block_size == block_size
 
     cache_device = torch.device(configure_device)
-    k_pages, v_pages = _fresh_pages(num_blocks, num_kv_heads, block_size, head_size, cache_device)
+    fp8 = attn_impl.kv_cache_fp8
+    k_pages, v_pages = _fresh_pages(
+        num_blocks, num_kv_heads, block_size, head_size, cache_device, fp8
+    )
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
     if hist_slots:
@@ -256,6 +263,19 @@ def _run_head_major_attn_test(
         )
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     _write(attn_impl, kv_cache, key_src, value_src, slot_mapping_t, cache_device)
+
+    if fp8:
+        # The cache holds e4m3 at unit scale: the reference reads what was stored, and
+        # the stored bytes are checked first, so a bad store and a bad read fail apart.
+        k_expected = quantize_kv(k_expected, 1.0, torch.float8_e4m3fn)
+        v_expected = quantize_kv(v_expected, 1.0, torch.float8_e4m3fn)
+        for name, pages, expected in (("K", k_pages, k_expected), ("V", v_pages, v_expected)):
+            # Through the device's fp8 -> fp16 conversion: the stored order is QFP8CH, so a
+            # raw byte copy would read shuffled.
+            stored = pages.to(DTYPE).to("cpu").float()
+            wrong = (stored != expected.float()).sum().item()
+            assert wrong == 0, f"fp8 {name} store: {wrong} of {stored.numel()} elements wrong"
+        k_expected, v_expected = k_expected.to(DTYPE), v_expected.to(DTYPE)
 
     # NaN, not empty: a store that lands nowhere has to fail here.
     output = torch.full_like(query, float("nan")).to(cache_device)
@@ -358,19 +378,18 @@ def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
         num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
     )
     layer = Mock(_k_scale_float=0.25, _v_scale_float=0.5)
-    impl.prepare_kv_scales(layer, torch.device("cpu"))
-    k_scale, v_scale = impl._kernel_kv_scales()
-    assert k_scale.tolist() == [0.25] and v_scale.tolist() == [0.5]
+    impl.prepare_kv_scales(layer)
+    assert impl._kernel_kv_scales() == (0.25, 0.5)
     # A model-dtype cache passes no scales, so its kernels trace as before.
     plain = SpyreHeadMajorAttentionImpl(num_heads=8, head_size=128, scale=1.0, num_kv_heads=2)
-    plain.prepare_kv_scales(layer, torch.device("cpu"))
+    plain.prepare_kv_scales(layer)
     assert plain._kernel_kv_scales() == ()
 
 
 def test_fp8_quantize_saturates():
     """The float8 cast maps an overflow to NaN; the store must clamp first."""
     x = torch.tensor([1e4, -1e4, 3.0], dtype=DTYPE)
-    stored = quantize_kv(x, torch.tensor([0.05], dtype=DTYPE), torch.float8_e4m3fn)
+    stored = quantize_kv(x, 0.05, torch.float8_e4m3fn)
     assert stored.float().tolist() == [448.0, -448.0, 60.0]
 
 
@@ -383,8 +402,8 @@ def _fp8_pages(num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale)
     return (
         k8,
         v8,
-        (k8.float() * k_scale.float()).to(DTYPE),
-        (v8.float() * v_scale.float()).to(DTYPE),
+        (k8.float() * k_scale).to(DTYPE),
+        (v8.float() * v_scale).to(DTYPE),
     )
 
 
@@ -396,8 +415,7 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size, num_blocks, padded_q = 2, 4, 128, 64, 3, 4
     num_heads = num_kv_heads * qpk
-    k_scale = torch.tensor([0.05], dtype=DTYPE)
-    v_scale = torch.tensor([0.02], dtype=DTYPE)
+    k_scale, v_scale = 0.05, 0.02
     k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
 
     query = torch.randn(padded_q, num_heads, head_size).to(DTYPE)
@@ -426,8 +444,7 @@ def test_fp8_batched_decode_reads_match_the_dequantized_cache(monkeypatch):
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
     num_seqs, bpc, num_chunks = 2, 2, 3
-    k_scale = torch.tensor([0.05], dtype=DTYPE)
-    v_scale = torch.tensor([0.02], dtype=DTYPE)
+    k_scale, v_scale = 0.05, 0.02
     k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
 
     query = torch.randn(num_seqs, num_kv_heads * qpk, head_size).to(DTYPE)
@@ -629,6 +646,28 @@ def test_head_major_attn_core(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize("seq_lens", _SHAPES)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_attn_fp8_kv_cache(
+    default_vllm_config, seq_lens, configure_compilation, configure_device
+):
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        kv_cache_dtype="fp8",
     )
 
 

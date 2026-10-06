@@ -1216,8 +1216,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."
             )
-        # Per-layer (k_scale, v_scale) on device; see `prepare_kv_scales`.
-        self._kv_scales: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
+        self._kv_scales: tuple[float, float] | None = None
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1657,24 +1657,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
-    def prepare_kv_scales(self, layer: AttentionLayer | None, device: torch.device) -> None:
-        """Mirror the layer's float8 KV scales to device once, outside any graph.
+    def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
+        """Read the layer's float8 KV scales once, outside any graph.
 
-        One-element tensors rather than floats: the 40 layers share one compiled
-        block, and a float per layer would specialise it once per distinct scale.
+        Floats the kernels bake in, and skip at 1.0 (a checkpoint without a
+        kv_cache_scheme). A [1] scale tensor would keep the compiled block shared
+        across layers with distinct scales, but its broadcast fails torch-spyre's
+        pointwise layout pass, so per-layer scales instead cost a compile each.
         """
         if not self.kv_cache_fp8 or self._kv_scales is not None:
             return
-        # Python floats, set by upstream after weight loading (1.0 when the checkpoint
-        # ships no KV scales).
-        scales = (
+        # Set by upstream after weight loading.
+        self._kv_scales = (
             float(getattr(layer, "_k_scale_float", 1.0)),
             float(getattr(layer, "_v_scale_float", 1.0)),
         )
-        k_scale, v_scale = (
-            convert(torch.tensor([s], dtype=self.model_dtype), device=device) for s in scales
-        )
-        self._kv_scales = (k_scale, v_scale)
 
     def do_kv_cache_update(
         self,

@@ -197,7 +197,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
 
-    def _kernel_kv_scales(self) -> tuple[torch.Tensor, ...]:
+    def _kernel_kv_scales(self) -> tuple[float, ...]:
         """Trailing (k_scale, v_scale) kernel arguments; none for a model-dtype cache, so
         its kernels trace exactly as before."""
         if not self.kv_cache_fp8:
@@ -206,13 +206,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         return self._kv_scales
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs):
-        self.prepare_kv_scales(layer, kv_cache[0].device)
+        self.prepare_kv_scales(layer)
         return super().forward(
             layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs
         )
 
     def record_graphs(self, layer, kv_cache, builder) -> int:
-        self.prepare_kv_scales(layer, kv_cache[0].device)
+        self.prepare_kv_scales(layer)
         return super().record_graphs(layer, kv_cache, builder)
 
     def kv_write_index(
@@ -436,7 +436,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         k_rows, v_rows = self.kv_slot_views(kv_cache)
         # Already done for the layers attn_layer traces the write for; upstream's own
         # update op reaches here eagerly for the rest.
-        self.prepare_kv_scales(layer, key.device)
+        self.prepare_kv_scales(layer)
         self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, *self._kernel_kv_scales())
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.

@@ -19,9 +19,18 @@ import torch
 
 def quantize_kv(x, scale, dtype):
     """``x / scale`` saturated to ``dtype``'s range: the float8 cast itself does not
-    saturate, so an outlier would land as NaN."""
+    saturate, so an outlier would land as NaN.
+
+    On Spyre the conversion is ``spyre.qfp8ch``: a plain ``.to`` has no device lowering
+    and falls back to CPU, which writes sequential bytes the fp8 -> fp16 read reorders.
+    """
     fmax = torch.finfo(dtype).max
-    return torch.clamp(x / scale.view([1] * x.dim()), -fmax, fmax).to(dtype)
+    if scale != 1.0:
+        x = x / scale
+    x = torch.clamp(x, -fmax, fmax)
+    if x.device.type == "spyre":
+        return torch.ops.spyre.qfp8ch(x)
+    return x.to(dtype)
 
 
 def reshape_and_cache_head_major_kernel(
@@ -31,7 +40,7 @@ def reshape_and_cache_head_major_kernel(
 
     k/v_rows are [num_blocks * num_kv_heads * block_size, head_size] views; row_index is
     one [T] int64 tensor per KV head. A single index over a flattened (T, KV) source does
-    not compile (UnalignedStickSplit on the merged row axis). With k/v_scale ([1]) the
+    not compile (UnalignedStickSplit on the merged row axis). With float k/v_scale the
     rows are float8 and store ``K / k_scale`` and ``V / v_scale``.
     """
     # `key` is a strided view of the fused QKV projection, and the per-head slice of one

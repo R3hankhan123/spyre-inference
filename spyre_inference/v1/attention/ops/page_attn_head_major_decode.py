@@ -68,7 +68,7 @@ def page_attn_head_major_decode_kernel(
             torch-spyre#3770). Pure cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
-        k_scale / v_scale: [1] scales of a float8 cache, None for a model-dtype one.
+        k_scale / v_scale: float scales of a float8 cache, None for a model-dtype one.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
@@ -88,13 +88,13 @@ def page_attn_head_major_decode_kernel(
         # [num_kv_heads, 1] lets the split land per kv head.
         k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
         v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
-        if k_scale is not None:
+        if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
         scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
-        if k_scale is not None:
-            scores = scores * k_scale.view([1] * scores.dim())
+        if k_scale is not None and k_scale != 1.0:
+            scores = scores * k_scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after
             # it would un-mask the padded lanes.
@@ -139,8 +139,8 @@ def page_attn_head_major_decode_kernel(
         ),
     )
     attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
-    if v_scale is not None:
-        attn = attn * v_scale.view([1] * attn.dim())
+    if v_scale is not None and v_scale != 1.0:
+        attn = attn * v_scale
     if out is not None:
         out.index_copy_(0, query_row_index, attn)
         return out

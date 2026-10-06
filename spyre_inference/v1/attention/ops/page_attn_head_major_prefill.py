@@ -52,7 +52,7 @@ def page_attn_head_major_prefill_kernel(
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
-        k_scale / v_scale: [1] scales of a float8 cache, None for a model-dtype one.
+        k_scale / v_scale: float scales of a float8 cache, None for a model-dtype one.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
@@ -80,13 +80,13 @@ def page_attn_head_major_prefill_kernel(
         page_idx = page_index[0, 0:1]
         k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        if k_scale is not None:
+        if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
-        if k_scale is not None:
-            scores = scores * k_scale.view([1] * scores.dim())
+        if k_scale is not None and k_scale != 1.0:
+            scores = scores * k_scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
@@ -132,8 +132,8 @@ def page_attn_head_major_prefill_kernel(
     attn = tile_output / tile_sum
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)
-    if v_scale is not None:
-        attn = attn * v_scale.view([1] * attn.dim())
+    if v_scale is not None and v_scale != 1.0:
+        attn = attn * v_scale
     if out is not None:
         # Storing the full padded extent keeps this sequence's real query_len out of the
         # arguments, so it is not specialized on.
