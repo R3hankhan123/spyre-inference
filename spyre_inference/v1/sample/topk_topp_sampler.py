@@ -18,7 +18,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
-import spyre_inference.v1.sample.sampling_kernels  # noqa: F401
+from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
 
 
 def apply_top_k_top_p_sort_free(
@@ -41,7 +41,6 @@ def apply_top_k_top_p_sort_free(
     if (vals[:, -1:] == kth).any():
         vals, idx = logits.topk(int((logits >= kth).sum(dim=-1).max()), dim=-1)
     vals.masked_fill_(vals < kth, -float("inf"))
-    # Upstream's top-p, on the ascending order it sorts into.
     vals, idx = vals.flip(-1), idx.flip(-1)
     probs_sum = vals.softmax(dim=-1).cumsum_(dim=-1)
     top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
@@ -75,8 +74,8 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.28.0) with two
-        # Spyre changes: sort-free top-k (and top-k + top-p) and the fused
-        # Gumbel-max kernel. Re-sync with upstream on a vLLM bump.
+        # Spyre changes: sort-free top-k (and top-k + top-p) and a log-space
+        # Gumbel draw. Re-sync with upstream on a vLLM bump.
         if k is not None and p is not None:
             logits = apply_top_k_top_p_sort_free(logits, k, p)
         else:
@@ -86,7 +85,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        if not self.use_fp64_gumbel:
+        if not self.use_fp64_gumbel and use_sampling_kernels():
             # Per-row seeds offset into a precomputed Gumbel table, so the draw
             # is one pass with no noise tensor; seeded requests stay reproducible.
             seeds = torch.randint(0, 2**31, (logits.shape[0],), dtype=torch.long)
@@ -99,7 +98,11 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
                 ),
                 logits_to_return,
             )
-        q = torch.empty(logits.shape, dtype=torch.float64, device=logits.device)
+        # Exp(1) noise, generated like upstream random_sample but pinned to fp32
+        # (fp64 under use_fp64_gumbel) independent of the logits dtype, so the
+        # log never runs in fp16 (where small q underflows to 0 -> log = -inf).
+        noise_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
+        q = torch.empty(logits.shape, dtype=noise_dtype, device=logits.device)
         if len(generators) != logits.shape[0]:
             q.exponential_()
         for i, generator in generators.items():

@@ -16,7 +16,7 @@ import torch
 from vllm.config.model import LogprobsMode
 from vllm.v1.sample.sampler import Sampler
 
-import spyre_inference.v1.sample.sampling_kernels  # noqa: F401
+from spyre_inference.v1.sample.sampling_kernels import use_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 
@@ -33,4 +33,6 @@ class SpyreSampler(Sampler):
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+        if not use_sampling_kernels():
+            return Sampler.greedy_sample(logits)
         return torch.ops._spyre_C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]
