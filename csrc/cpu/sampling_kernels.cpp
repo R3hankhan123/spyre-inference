@@ -109,22 +109,41 @@ static void greedy_argmax_kernel(int64_t* __restrict__ output,
   for (int64_t b = 0; b < batch_size; ++b) {
     const float* row = logits + b * vocab_size;
 
+    // Vector max has no consistent NaN rule, so NaNs are caught via the sum:
+    // any NaN (or inf + -inf, a harmless false positive) makes it NaN.
     vec_op::FP32Vec16 vmax(-std::numeric_limits<float>::infinity());
+    vec_op::FP32Vec16 vsum(0.0f);
     for (int64_t i = 0; i < vec_end; i += VEC_ELEM_NUM) {
-      vmax = vmax.max(vec_op::FP32Vec16(row + i));
+      vec_op::FP32Vec16 v(row + i);
+      vmax = vmax.max(v);
+      vsum = vsum + v;
     }
     float best_val = vmax.reduce_max();
+    bool maybe_nan = std::isnan(vsum.reduce_sum());
     for (int64_t i = vec_end; i < vocab_size; ++i) {
+      maybe_nan |= std::isnan(row[i]);
       if (row[i] > best_val) {
         best_val = row[i];
       }
     }
 
-    int64_t best_idx = 0;
-    for (int64_t i = 0; i < vocab_size; ++i) {
-      if (row[i] == best_val) {
-        best_idx = i;
-        break;
+    int64_t best_idx = -1;
+    if (maybe_nan) {
+      // torch.argmax treats NaN as the maximum: return the first NaN.
+      for (int64_t i = 0; i < vocab_size; ++i) {
+        if (std::isnan(row[i])) {
+          best_idx = i;
+          break;
+        }
+      }
+    }
+    if (best_idx < 0) {
+      best_idx = 0;
+      for (int64_t i = 0; i < vocab_size; ++i) {
+        if (row[i] == best_val) {
+          best_idx = i;
+          break;
+        }
       }
     }
     output[b] = best_idx;
@@ -135,21 +154,27 @@ static void greedy_argmax_kernel(int64_t* __restrict__ output,
 
 torch::Tensor fused_gumbel_argmax(const torch::Tensor& logits,
                                   const torch::Tensor& seeds) {
+  TORCH_CHECK(logits.device().is_cpu(), "logits must be a CPU tensor");
   TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, vocab]");
   TORCH_CHECK(logits.scalar_type() == torch::kFloat32,
               "logits must be float32");
+  TORCH_CHECK(seeds.device().is_cpu(), "seeds must be a CPU tensor");
+  TORCH_CHECK(seeds.scalar_type() == torch::kInt64, "seeds must be int64");
   TORCH_CHECK(seeds.dim() == 1 && seeds.size(0) == logits.size(0),
               "seeds must be 1-D with batch_size elements");
 
   auto logits_contig = logits.contiguous();
+  auto seeds_contig = seeds.contiguous();
   auto output = torch::empty({logits_contig.size(0)}, torch::kInt64);
-  fused_gumbel_argmax_kernel(
-      output.data_ptr<int64_t>(), logits_contig.data_ptr<float>(),
-      seeds.data_ptr<int64_t>(), logits_contig.size(0), logits_contig.size(1));
+  fused_gumbel_argmax_kernel(output.data_ptr<int64_t>(),
+                             logits_contig.data_ptr<float>(),
+                             seeds_contig.data_ptr<int64_t>(),
+                             logits_contig.size(0), logits_contig.size(1));
   return output;
 }
 
 torch::Tensor greedy_argmax(const torch::Tensor& logits) {
+  TORCH_CHECK(logits.device().is_cpu(), "logits must be a CPU tensor");
   TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, vocab]");
   TORCH_CHECK(logits.scalar_type() == torch::kFloat32,
               "logits must be float32");

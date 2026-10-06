@@ -42,6 +42,7 @@ import bisect
 import time
 from contextlib import contextmanager
 from typing import Any, cast
+from unittest import mock
 
 import numpy as np
 import torch
@@ -67,6 +68,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -591,7 +593,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Spyre doesn't support all dtypes (int32, bool) natively.
         # _make_buffer (overridden below) already places .gpu on Spyre
         # via self._spyre_device regardless of self.device.
-        with _torch_cuda_wrapper():
+        # Build SpyreSampler where upstream builds Sampler, so every holder of the
+        # sampler (e.g. RejectionSampler) shares the one Spyre instance.
+        with _torch_cuda_wrapper(), mock.patch.object(gpu_model_runner, "Sampler", SpyreSampler):
             super().__init__(vllm_config, torch.device("cpu"))
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
@@ -599,8 +603,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
-
-        self.sampler = SpyreSampler(self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel)
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False

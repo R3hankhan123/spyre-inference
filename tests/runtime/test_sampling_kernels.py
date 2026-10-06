@@ -82,3 +82,30 @@ def test_falls_back_to_torch_without_kernels(monkeypatch: pytest.MonkeyPatch) ->
     topk = SpyreTopKTopPSampler("raw_logprobs", False)
     out = topk.forward_native(logits.clone(), {}, k, None)[0]
     assert (out.unsqueeze(1) == logits.topk(5).indices).any(dim=1).all()
+
+
+def test_gumbel_strided_seeds_match_contiguous() -> None:
+    logits = torch.randn(8, 32000)
+    seeds = torch.randint(0, 2**31, (16,), dtype=torch.long)[::2]
+    assert not seeds.is_contiguous()
+    assert torch.equal(
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds),
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.contiguous()),
+    )
+    with pytest.raises(RuntimeError, match="seeds must be int64"):
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.int())
+
+
+def test_greedy_nan_matches_argmax() -> None:
+    # torch.argmax treats NaN as the maximum and returns the first one.
+    vocab = 32003  # off a SIMD-width multiple, so the last NaN lands in the scalar tail
+    x = torch.randn(6, vocab)
+    x[0, 100] = float("nan")  # before the real max
+    x[0, 200] = 50.0
+    x[1, 200] = 50.0
+    x[1, 300] = float("nan")  # after the real max
+    x[2, [7, 9000]] = float("nan")
+    x[3, vocab - 1] = float("nan")
+    x[4, 10] = float("inf")
+    x[4, 20] = float("-inf")  # inf + -inf: NaN sum without a NaN logit
+    assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))
