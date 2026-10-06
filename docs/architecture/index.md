@@ -486,16 +486,21 @@ fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts t
 for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
 large share of each decode step.
 
-`SpyreModelRunner` replaces the sampler with `SpyreSampler` (`v1/sample/sampler.py`),
-which brings back the CPU kernels and drops the full-vocabulary sort:
+`SpyreModelRunner` builds `SpyreSampler` (`v1/sample/sampler.py`) where upstream builds
+`Sampler`, so the rejection sampler shares it. It brings back the CPU kernels and drops the
+full-vocabulary sort:
 
 - **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
-  `torch.ops._spyre_C.fused_gumbel_argmax`: one SIMD pass of `argmax(logits + g)`, with the
-  Gumbel noise `g` read from a fixed 2^20-entry table at a per-row random offset. Adding the
-  same constant to every logit cannot change the argmax, so the draw needs no softmax, no
-  per-element RNG, and no noise tensor. A seeded request draws its row offset from its own
-  `torch.Generator`, so it stays reproducible. `use_fp64_gumbel` keeps fresh fp64 noise,
-  drawn in log space (`argmax(x - log q)`, `q ~ Exp(1)`).
+  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
+  Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
+  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
+  running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
+  others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
+  seeded request draws its row seed from its own `torch.Generator`, so it stays
+  reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
+  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
+  table instead, which limits each row to 2^20 noise windows and leaves much of a large
+  vocabulary unreachable.
 - **Greedy** — `SpyreSampler.greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
   vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the

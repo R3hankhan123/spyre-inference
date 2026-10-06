@@ -91,7 +91,7 @@ def test_topk_topp_sort_free_matches_full_sort(rows: int, vocab: int, ties: str)
 # The override applies top-k up front and delegates the rest upstream, so it must
 # stay token-for-token identical to the stock joint sort. Both cases exercise the
 # override's top-k pre-filter (top-p-only would delegate to super unchanged).
-# fp64 Gumbel keeps fresh noise on both sides; the fused kernel's table draw is
+# fp64 Gumbel keeps fresh noise on both sides; the fused kernel's hashed draw is
 # covered in test_sampling_kernels.
 @pytest.mark.parametrize("k,p", [(50, None), (50, 0.8)], ids=["topk", "topk_topp"])
 @pytest.mark.parametrize("rows", [1, 8])
@@ -100,7 +100,10 @@ def test_swapped_sampler_matches_stock_tokens(
     rows: int, vocab: int, k: int | None, p: float | None
 ) -> None:
     meta = _meta(rows, k=k, p=p)
-    logits = torch.randn(rows, vocab, dtype=torch.float16)
+    # fp32 so no logits tie: on a tie straddling the top-p cutoff, which tied
+    # token survives is arbitrary (see test_topk_topp_sort_free_matches_full_sort).
+    torch.manual_seed(rows + vocab)
+    logits = torch.randn(rows, vocab, dtype=torch.float32)
 
     stock = Sampler(use_fp64_gumbel=True)
     torch.manual_seed(1234)
