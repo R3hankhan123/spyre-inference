@@ -31,6 +31,7 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.platform import TorchSpyrePlatform
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
@@ -45,7 +46,11 @@ from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
+    quantize_kv,
     reshape_and_cache_head_major_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -327,6 +332,116 @@ def test_head_major_write_index(default_vllm_config):
     # Every destination distinct: two writes sharing a row would silently drop one.
     stacked = torch.stack(per_head)
     assert stacked.unique().numel() == stacked.numel()
+
+
+def test_fp8_kv_cache_is_head_major_only(default_vllm_config):
+    assert "fp8" in SpyreHeadMajorAttentionBackend.supported_kv_cache_dtypes
+    assert "fp8" not in SpyreAttentionBackend.supported_kv_cache_dtypes
+
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    assert impl.kv_cache_fp8
+    with pytest.raises(ValueError, match="head-major"):
+        SpyreAttentionImpl(
+            num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+        )
+    # A float8 stick is 128 elements wide.
+    with pytest.raises(ValueError, match="head_size % 128"):
+        SpyreHeadMajorAttentionImpl(
+            num_heads=8, head_size=64, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+        )
+
+
+def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    layer = Mock(_k_scale_float=0.25, _v_scale_float=0.5)
+    impl.prepare_kv_scales(layer, torch.device("cpu"))
+    k_scale, v_scale = impl._kernel_kv_scales()
+    assert k_scale.tolist() == [0.25] and v_scale.tolist() == [0.5]
+    # A model-dtype cache passes no scales, so its kernels trace as before.
+    plain = SpyreHeadMajorAttentionImpl(num_heads=8, head_size=128, scale=1.0, num_kv_heads=2)
+    plain.prepare_kv_scales(layer, torch.device("cpu"))
+    assert plain._kernel_kv_scales() == ()
+
+
+def test_fp8_quantize_saturates():
+    """The float8 cast maps an overflow to NaN; the store must clamp first."""
+    x = torch.tensor([1e4, -1e4, 3.0], dtype=DTYPE)
+    stored = quantize_kv(x, torch.tensor([0.05], dtype=DTYPE), torch.float8_e4m3fn)
+    assert stored.float().tolist() == [448.0, -448.0, 60.0]
+
+
+def _fp8_pages(num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale):
+    """Random head-major pages stored as float8, and the model-dtype pages they decode to."""
+    k = (torch.randn(num_pages, num_kv_heads, block_size, head_size) * 3).to(DTYPE)
+    v = torch.randn(num_pages, num_kv_heads, block_size, head_size).to(DTYPE)
+    k8 = quantize_kv(k, k_scale, torch.float8_e4m3fn)
+    v8 = quantize_kv(v, v_scale, torch.float8_e4m3fn)
+    return (
+        k8,
+        v8,
+        (k8.float() * k_scale.float()).to(DTYPE),
+        (v8.float() * v_scale.float()).to(DTYPE),
+    )
+
+
+def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
+    """A float8 cache read through the scales equals the model-dtype read of its values."""
+    from spyre_inference.v1.attention.ops import tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    set_random_seed(0)
+    num_kv_heads, qpk, head_size, block_size, num_blocks, padded_q = 2, 4, 128, 64, 3, 4
+    num_heads = num_kv_heads * qpk
+    k_scale = torch.tensor([0.05], dtype=DTYPE)
+    v_scale = torch.tensor([0.02], dtype=DTYPE)
+    k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
+
+    query = torch.randn(padded_q, num_heads, head_size).to(DTYPE)
+    rows = torch.arange(padded_q, dtype=torch.int32)
+    index_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    index_table[:, 0] = torch.tensor([4, 1, 3])
+    mask = torch.zeros(num_blocks, padded_q, block_size, dtype=DTYPE)
+    mask[-1, :, 40:] = float("-inf")
+    args = (num_blocks, padded_q, num_heads, num_kv_heads, head_size, block_size)
+    scale = head_size**-0.5
+
+    got = page_attn_head_major_prefill_kernel(
+        query, rows, k8, v8, index_table, mask, scale, *args, 0.0, None, k_scale, v_scale
+    )
+    want = page_attn_head_major_prefill_kernel(
+        query, rows, k_dq, v_dq, index_table, mask, scale, *args
+    )
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+def test_fp8_batched_decode_reads_match_the_dequantized_cache(monkeypatch):
+    from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
+    set_random_seed(0)
+    num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
+    num_seqs, bpc, num_chunks = 2, 2, 3
+    k_scale = torch.tensor([0.05], dtype=DTYPE)
+    v_scale = torch.tensor([0.02], dtype=DTYPE)
+    k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
+
+    query = torch.randn(num_seqs, num_kv_heads * qpk, head_size).to(DTYPE)
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat(bpc)
+    page_ids = torch.randint(0, 6, (num_chunks * bpc, num_seqs), dtype=torch.int64)
+    mask = torch.zeros(num_chunks * bpc, num_seqs, 1, 1, block_size, dtype=DTYPE)
+    mask[-1, ..., 32:] = float("-inf")
+    args = (head_size**-0.5, num_seqs, bpc, num_kv_heads, qpk, block_size, head_size)
+
+    got = batched_decode_head_major_kernel(
+        query, rep_row_ids, k8, v8, page_ids, mask, *args, 0.0, None, k_scale, v_scale
+    )
+    want = batched_decode_head_major_kernel(query, rep_row_ids, k_dq, v_dq, page_ids, mask, *args)
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
 def test_token_major_write_index_is_the_slot_mapping(default_vllm_config):

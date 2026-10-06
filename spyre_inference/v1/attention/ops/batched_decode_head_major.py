@@ -99,6 +99,8 @@ def batched_decode_head_major_kernel(
     head_size,
     logits_soft_cap=0.0,
     out=None,
+    k_scale=None,
+    v_scale=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -112,6 +114,9 @@ def batched_decode_head_major_kernel(
     H is num_kv_heads for the tiled walk and 1 (broadcast) for the Python walk.
     The split-index form is used only with for_each_tile; its explicit device
     layout places each page ID in a separate stick so entries can split across cores.
+
+    With k/v_scale ([1]) the pages are float8: each is cast to the query dtype after its
+    gather, k_scale scales the scores and v_scale the output.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -150,7 +155,12 @@ def batched_decode_head_major_kernel(
         # staging layout. Costs the eager path, which the preconditions decline.
         k_page = k_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
         v_page = v_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
+        if k_scale is not None:
+            k_page = k_page.to(q.dtype)
+            v_page = v_page.to(q.dtype)
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        if k_scale is not None:
+            scores = scores * k_scale.view([1] * scores.dim())
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
@@ -225,6 +235,8 @@ def batched_decode_head_major_kernel(
     else:
         _, tile_sum, tile_output = carry
         attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    if v_scale is not None:
+        attn = attn * v_scale.view([1] * attn.dim())
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
