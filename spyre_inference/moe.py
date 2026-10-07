@@ -50,6 +50,11 @@ if TYPE_CHECKING:
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
+        spyre_moe_split_offsets: torch.Tensor | None
+        spyre_moe_prefill_form: str | None
+        spyre_moe_prefill_gate: torch.Tensor
+        spyre_moe_prefill_up: torch.Tensor
+        spyre_moe_prefill_down: torch.Tensor
 
 
 logger = init_logger(__name__)
@@ -183,11 +188,19 @@ def _routing_weights(
     return weights, indices
 
 
-def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tensor:
+def _gather_indices(
+    indices: torch.Tensor, top_k: int, stick: int, split_offsets: torch.Tensor | None = None
+) -> torch.Tensor:
     tokens = indices.shape[0]
     widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
-    address = widened.to(torch.float32)[..., : stick // 2].to(torch.int32)
-    return address[..., 0]
+    address = widened.to(torch.float32)[..., : stick // 2]
+    if split_offsets is not None:
+        # Expert ``e``'s slice ``j`` is row ``e * split + j`` of the sliced stack. Spyre cannot
+        # schedule an integer add, so the address is formed while it is still float.
+        split = split_offsets.shape[0]
+        address = address[:, :, None, :] * split + split_offsets[None, None]
+        address = address.reshape(tokens, top_k * split, stick // 2)
+    return address.to(torch.int32)[..., 0]
 
 
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
@@ -217,6 +230,53 @@ def _moe_gathered(
     up_out = torch.bmm(inputs, up[indices].reshape(rows, hidden, inter))
     expert_out = torch.bmm(
         _activation(gate_out, up_out, activation), down[indices].reshape(rows, inter, hidden)
+    ).reshape(tokens, top_k, hidden)
+    return (expert_out * weights[..., None]).sum(dim=1)
+
+
+def _moe_gathered_split(
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    top_k: int,
+    stick: int,
+    reduce_dtype: torch.dtype,
+    routing: str,
+    activation: str,
+    split_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """``_moe_gathered`` over stacks cut into ``split`` slices per expert.
+
+    A gather divides across cores only along its index entries, never along the shared
+    table's data dims, so ``top_k`` whole experts occupy at most ``top_k`` cores; ``split``
+    slices make ``top_k * split`` entries. Every slice is cut along ``H``: ``gate``/``up`` are
+    ``[E * split, H / split, M]``, whose slices' partial products are summed back, and
+    ``down`` is ``[E * split, M, H / split]``, whose slices' outputs are concatenated.
+    """
+    tokens, hidden = x.shape
+    split = split_offsets.shape[0]
+    hidden_slice, inter = gate.shape[1:]
+    weights, indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
+    indices = _gather_indices(indices, top_k, stick, split_offsets)
+    rows = tokens * top_k
+    inputs = (
+        x.reshape(tokens, 1, split, hidden_slice)
+        .expand(tokens, top_k, split, hidden_slice)
+        .contiguous()
+        .reshape(rows * split, 1, hidden_slice)
+    )
+
+    def project(stack: torch.Tensor) -> torch.Tensor:
+        out = torch.bmm(inputs, stack[indices].reshape(rows * split, hidden_slice, inter))
+        return out.reshape(rows, split, inter).sum(dim=1)
+
+    activated = _activation(project(gate), project(up), activation)
+    activated = activated[:, None, :].expand(rows, split, inter).contiguous()
+    expert_out = torch.bmm(
+        activated.reshape(rows * split, 1, inter),
+        down[indices].reshape(rows * split, inter, hidden_slice),
     ).reshape(tokens, top_k, hidden)
     return (expert_out * weights[..., None]).sum(dim=1)
 
@@ -307,8 +367,101 @@ def _moe_persistent(
     return result
 
 
+def _name_sliced_persistent_dims(
+    x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor
+) -> None:
+    from torch_spyre._inductor.wsr.propagate_named_dims import (
+        declare_tensor_dim,
+        name_tensor_dims,
+    )
+
+    slices, hidden_slice, inter = gate.shape
+    for name, extent in (
+        ("E", slices),
+        ("T", x.shape[0]),
+        ("H", x.shape[1]),
+        ("HS", hidden_slice),
+        ("M", inter),
+        ("ONE", 1),
+    ):
+        declare_tensor_dim(name, extent)
+    name_tensor_dims(x, ["T", "H"])
+    name_tensor_dims(gate, ["E", "HS", "M"])
+    name_tensor_dims(up, ["E", "HS", "M"])
+    name_tensor_dims(down, ["E", "M", "HS"])
+
+
+def _moe_persistent_sliced(
+    x: torch.Tensor,
+    route: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    activation: str,
+    split: int,
+    whole_down: bool,
+) -> torch.Tensor:
+    """``_moe_persistent`` over the stacks ``_moe_gathered_split`` reads.
+
+    One trip still covers one expert: every tiled operand steps ``split`` rows, so the
+    route is repeated per slice to share the trip count. A trip's gate/up rows are that
+    expert's whole ``[H, M]`` matrix. Down's slices are either laid back out as the whole
+    ``[M, H]`` (``whole_down``), keeping ``x``'s named ``[T, H]`` carry, or multiplied as
+    one batched matmul into a ``[split, T, H / split]`` carry laid out once after the loop.
+    Which is faster depends on ``M``; see ``_prefill_form``. Indexing a loop tile
+    per slice is not an option: on Spyre it reads the wrong rows.
+    """
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    tokens, hidden = x.shape
+    experts = route.shape[1]
+    inter = gate.shape[-1]
+    # Hinted after the expansion: the hint names the op's output, and only the final
+    # ``[E * split, T, 1]`` matches its three names.
+    route = route.unsqueeze(2).expand(tokens, experts, split, 1).reshape(tokens, -1, 1)
+    with spyre_hint(named_dims=["E", "T", "ONE"]):
+        route = route.permute(1, 0, 2).contiguous().clone()
+
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        gated = torch.matmul(x, gate_tile.reshape(hidden, inter))
+        upped = torch.matmul(x, up_tile.reshape(hidden, inter))
+        activated = _activation(gated, upped, activation)
+        if whole_down:
+            down_whole = down_tile.permute(1, 0, 2).reshape(inter, hidden)
+            return acc + torch.matmul(activated, down_whole) * route_tile[0], None
+        return acc + torch.matmul(activated, down_tile) * route_tile, None
+
+    init = torch.zeros_like(x) if whole_down else x.new_zeros(split, tokens, hidden // split)
+    with spyre_hint(work_div={"T": _token_cores(tokens)}):
+        result, _ = for_each_tile(
+            expert_body,
+            (x, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=split,
+            init=init,
+        )
+    return result if whole_down else result.permute(1, 0, 2).reshape(tokens, hidden)
+
+
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
+    split_offsets = getattr(layer, "spyre_moe_split_offsets", None)
+    if split_offsets is not None:
+        return _moe_gathered_split(
+            x,
+            router_logits,
+            layer.spyre_moe_gate,
+            layer.spyre_moe_up,
+            layer.spyre_moe_down,
+            layer.top_k,
+            layer.spyre_moe_stick,
+            layer.spyre_moe_route_dtype,
+            recipe.routing,
+            recipe.activation,
+            split_offsets,
+        )
     return _moe_gathered(
         x,
         router_logits,
@@ -366,15 +519,28 @@ def _route_selected(layer: RoutedExperts, topk_probs: torch.Tensor) -> torch.Ten
     )
 
 
+def _prefill_stacks(layer: RoutedExperts) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if getattr(layer, "spyre_moe_prefill_form", None) == "unsliced":
+        return (
+            layer.spyre_moe_prefill_gate,
+            layer.spyre_moe_prefill_up,
+            layer.spyre_moe_prefill_down,
+        )
+    return layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down
+
+
 def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torch.Tensor:
-    return _moe_persistent(
-        x,
-        route,
-        layer.spyre_moe_gate,
-        layer.spyre_moe_up,
-        layer.spyre_moe_down,
-        layer.spyre_moe_recipe.activation,
-    )
+    form = getattr(layer, "spyre_moe_prefill_form", None)
+    if form in ("batched", "whole"):
+        return _moe_persistent_sliced(
+            x,
+            route,
+            *_prefill_stacks(layer),
+            layer.spyre_moe_recipe.activation,
+            layer.spyre_moe_split_offsets.shape[0],
+            form == "whole",
+        )
+    return _moe_persistent(x, route, *_prefill_stacks(layer), layer.spyre_moe_recipe.activation)
 
 
 def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
@@ -410,6 +576,67 @@ def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch
     return moved
 
 
+def _prefill_form(tp_size: int) -> str:
+    """How the prefill loop reads the experts of a layer whose decode path is sliced.
+
+    ``"batched"`` and ``"whole"`` read the sliced stacks, multiplying down's slices as one
+    batched matmul or rebuilding each expert's ``[M, H]``; ``"unsliced"`` keeps a whole-
+    expert copy for ``_moe_persistent``. TP narrows each expert's ``M``, which decides the
+    fastest form, measured on gemma-4-26B-A4B: batched at TP=1, whole at TP=2, and from
+    TP=4 neither beats the unsliced loop, whose second copy is a quarter of the experts per
+    card.
+    """
+    if tp_size == 1:
+        return "batched"
+    return "whole" if tp_size == 2 else "unsliced"
+
+
+def _split_offsets(split: int, stick: int) -> torch.Tensor:
+    """Slice ``j``'s address offset, ``[split, stick // 2]`` float32.
+
+    Widened along the address's stick dim, so adding it broadcasts only over the slice dim:
+    a 1-D ``[split]`` operand would put its stick on the slice dim, which no restick resolves.
+    """
+    return torch.arange(split, dtype=torch.float32)[:, None].expand(split, stick // 2).contiguous()
+
+
+def _gather_split(requested: int, hidden: int, stick: int) -> int:
+    """The requested slice count, or 1 if a slice of ``hidden`` would split a stick."""
+    if requested <= 1:
+        return 1
+    if hidden % (requested * stick):
+        logger.warning_once(
+            "Spyre: SPYRE_MOE_GATHER_SPLIT=%d does not cut hidden=%d into whole %d-element "
+            "sticks; gathering whole experts.",
+            requested,
+            hidden,
+            stick,
+        )
+        return 1
+    logger.info_once("Spyre: gathering each routed expert as %d slices.", requested)
+    return requested
+
+
+def _to_spyre_sliced_weight(
+    weight: torch.Tensor, pad: tuple[int, ...], split: int, *, cut_free: bool
+) -> torch.Tensor:
+    """``weight`` widened like ``_to_spyre_expert_weight``, then cut into ``split`` slices.
+
+    ``[E, C, F]`` becomes ``[E * split, C / split, F]``, or with ``cut_free``
+    ``[E * split, C, F / split]``; expert ``e``'s slice ``j`` is row ``e * split + j``. It is
+    cut on the host: gathering from a view of the device stack does not lower.
+    """
+    if any(pad):
+        weight = F.pad(weight, pad)
+    experts, rows, free = weight.shape
+    if cut_free:
+        weight = weight.reshape(experts, rows, split, free // split).transpose(1, 2)
+        sliced = weight.reshape(experts * split, rows, free // split)
+    else:
+        sliced = weight.reshape(experts * split, rows // split, free)
+    return _to_spyre_expert_weight(sliced.contiguous(), ())
+
+
 def _prepare_layer(layer: RoutedExperts) -> None:
     from torch_spyre._C import get_elem_in_stick
 
@@ -437,14 +664,32 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"the {stick}-element stick; hidden_size must be stick-aligned."
         )
     pad = -inter % stick
-    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
-    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
-    del layer.w13_weight, w13
+    split = _gather_split(envs.SPYRE_MOE_GATHER_SPLIT, hidden, stick)
+    prefill_form = _prefill_form(layer.moe_config.tp_size) if split > 1 else None
+    # Sliced stacks replace the whole ones, unless prefill reads the experts unsliced.
+    gate, up = w13[:, :inter, :].transpose(1, 2), w13[:, inter:, :].transpose(1, 2)
+    if split > 1:
+        layer.spyre_moe_gate = _to_spyre_sliced_weight(gate, (0, pad), split, cut_free=False)
+        layer.spyre_moe_up = _to_spyre_sliced_weight(up, (0, pad), split, cut_free=False)
+    else:
+        layer.spyre_moe_gate = _to_spyre_expert_weight(gate, (0, pad))
+        layer.spyre_moe_up = _to_spyre_expert_weight(up, (0, pad))
+    if prefill_form == "unsliced":
+        layer.spyre_moe_prefill_gate = _to_spyre_expert_weight(gate, (0, pad))
+        layer.spyre_moe_prefill_up = _to_spyre_expert_weight(up, (0, pad))
+    del layer.w13_weight, w13, gate, up
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    if split > 1:
+        layer.spyre_moe_down = _to_spyre_sliced_weight(
+            w2.transpose(1, 2), (0, 0, 0, pad), split, cut_free=True
+        )
+    else:
+        layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    if prefill_form == "unsliced":
+        layer.spyre_moe_prefill_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
@@ -455,6 +700,8 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         else dtype
     )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
+    layer.spyre_moe_split_offsets = _split_offsets(split, stick).to("spyre") if split > 1 else None
+    layer.spyre_moe_prefill_form = prefill_form
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
@@ -510,7 +757,11 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
-            _name_persistent_dims(x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down)
+            stacks = _prefill_stacks(layer)
+            if getattr(layer, "spyre_moe_prefill_form", None) in ("batched", "whole"):
+                _name_sliced_persistent_dims(x, *stacks)
+            else:
+                _name_persistent_dims(x, *stacks)
             try:
                 with persistent_scope:
                     return _region(layer, "experts", _experts)(layer, x, route)

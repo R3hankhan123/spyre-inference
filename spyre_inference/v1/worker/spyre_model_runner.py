@@ -114,6 +114,10 @@ from spyre_inference.v1.pool.spyre_pooler import (
     _mean_pool_row_mask_mul,
 )
 from spyre_inference.v1.sample.sampler import install_spyre_sampler
+from spyre_inference.v1.spec_decode.gemma4_proposer import (
+    SpyreGemma4Proposer,
+    create_spyre_drafter,
+)
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -557,6 +561,39 @@ class _SpyreModelWrapper:
             setattr(self._model, name, value)
 
 
+class _SpyreDraftModelWrapper(_SpyreModelWrapper):
+    """The MTP drafter's boundary, which also takes a float input: the target's hidden state.
+
+    The proposer, unlike the runner, never pads its batch, so every input is padded here
+    onto a compiled body bucket. Outputs come back to the host before the trim, avoiding
+    a dim-0 slice on device.
+    """
+
+    def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds=None):
+        num_tokens = positions.shape[-1]
+        bucketer = self._shape_bucketer
+        padded = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        pad = 0 if padded is None else padded - num_tokens
+
+        def to_spyre(t: torch.Tensor | None, rows_last: bool) -> torch.Tensor | None:
+            if t is None:
+                return None
+            if pad:
+                t = convert(t, device="cpu")
+                t = F.pad(t, (0, pad) if rows_last else (0, 0, 0, pad))
+            if t.is_floating_point():
+                return convert(t, device=self._spyre_device, dtype=self._model_dtype)
+            return convert(t, device=self._spyre_device, dtype=torch.int64)
+
+        result = self._model(
+            input_ids=to_spyre(input_ids, rows_last=True),
+            positions=to_spyre(positions, rows_last=True),
+            hidden_states=to_spyre(hidden_states, rows_last=False),
+            inputs_embeds=to_spyre(inputs_embeds, rows_last=False),
+        )
+        return tuple(convert(t, device="cpu")[:num_tokens] for t in result)
+
+
 class TorchSpyreModelRunner(GPUModelRunner):
     """Model runner for Spyre.
 
@@ -606,6 +643,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # via self._spyre_device regardless of self.device.
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, torch.device("cpu"))
+            # Upstream built its own Gemma4Proposer; replace it before anything uses it.
+            if hasattr(self, "drafter"):
+                self.drafter = create_spyre_drafter(vllm_config, self)
         install_spyre_sampler(self.sampler)
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
@@ -666,11 +706,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.lora_config:
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
-        if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
-
         # Restore original RoPE frequencies and attention scale, and compensate
         # QK-norm epsilon for the padded head_dim. All passes are scoped to the
         # padded text backbone (see custom_ops.text_backbone).
@@ -722,11 +757,46 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logits_row_buckets=(
                 []
                 if bucketer is None
-                else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
+                else logits_row_buckets(bucketer.bucket_sizes, self._max_logits_rows)
             ),
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+        )
+
+        if hasattr(self, "drafter"):
+            self._load_drafter()
+
+    @property
+    def _max_logits_rows(self) -> int:
+        """Rows the target lm_head can see: a verify step samples every draft plus a bonus."""
+        return self.max_num_reqs * (1 + self.num_spec_tokens)
+
+    def _load_drafter(self) -> None:
+        """Load the MTP assistant onto Spyre, compiled per block like the target."""
+        drafter = cast(SpyreGemma4Proposer, self.drafter)
+        logger.info("Loading drafter %s...", drafter.draft_model_config.model)
+        drafter.load_model(self.get_model())
+        attn_layer.install_kv_readers(drafter.attention_layers())
+        draft_model = drafter.model
+        draft_model.to(device=self._spyre_device)
+        if not (
+            self.vllm_config.model_config.enforce_eager
+            or self.compilation_config.mode is CompilationMode.NONE
+        ):
+            num_blocks = self._compile_blocks(model=draft_model)
+            logger.info("Wrapped %d drafter blocks for per-block compile on Spyre.", num_blocks)
+        bucketer = self.spyre_shape_bucketer
+        drafter.model = _SpyreDraftModelWrapper(
+            draft_model,
+            self._spyre_device,
+            logits_row_buckets=(
+                []
+                if bucketer is None
+                else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
+            ),
+            shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     @staticmethod
@@ -849,12 +919,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
-    def _compile_blocks(self, fullgraph: bool = True) -> int:
+    def _compile_blocks(self, fullgraph: bool = True, model: nn.Module | None = None) -> int:
         num_blocks = 0
         # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
         # alias blocks across lists; recompiling one is harmless but would double the count.
         seen: set[int] = set()
-        for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
+        for blocks in _repeated_block_lists(cast(nn.Module, model or self.model)):
             for block in blocks:
                 if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
@@ -942,7 +1012,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             bucket_sizes[0] if bucket_sizes else 0,
             bucket_sizes[-1] if bucket_sizes else 0,
         )
-        row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs)
+        row_widths = logits_row_buckets(bucket_sizes, self._max_logits_rows)
         t0 = time.time()
         with _set_spyre_compilation_settings(self.vllm_config):
             # Compile largest bucket first: Inductor's internal caches benefit
@@ -956,9 +1026,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     widest_hidden_states = last_hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
+            # Allocated rather than sliced: a dummy run samples one row per dummy request,
+            # fewer than a speculative verify step's rows, and the sampler run only
+            # reads the shape.
             if widest_hidden_states is not None:
+                hidden_size = widest_hidden_states.shape[-1]
                 for rows in sorted(row_widths, reverse=True):
-                    self._dummy_sampler_run(widest_hidden_states[:rows])
+                    self._dummy_sampler_run(widest_hidden_states.new_zeros(rows, hidden_size))
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -1862,6 +1936,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._spyre_kv_caches = dict(kv_caches)
         return kv_caches
+
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
+        """Also register each KV-sharing layer in its group's per-layer spec dict.
+
+        With the hybrid manager disabled, layers of differing head shapes share one group
+        under a UniformTypeKVCacheSpecs, and ``initialize_attn_backend`` looks every group
+        member up in its per-layer dict. Upstream appends a sharing layer (an MTP drafter's)
+        to the group but not to that dict, so the lookup raises.
+        """
+        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        for group in kv_cache_config.kv_cache_groups:
+            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if per_layer is None:
+                continue
+            for layer_name, target in self.shared_kv_cache_layers.items():
+                if target in per_layer:
+                    per_layer.setdefault(layer_name, per_layer[target])
+
+    def _copy_draft_token_ids_to_cpu(self, scheduler_output, zeros_only: bool = False) -> None:
+        """Upstream's copy-stream version, minus the stream: the draft ids are host tensors.
+
+        The platform turns async scheduling off with a drafter, so the copy always runs.
+        """
+        draft_token_ids = self._draft_token_ids
+        if not torch.is_tensor(draft_token_ids):
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+            return
+        assert isinstance(draft_token_ids, torch.Tensor)
+        assert self.draft_token_ids_cpu is not None
+        num_reqs, num_spec_tokens = draft_token_ids.shape
+        self.prev_num_spec_tokens = num_spec_tokens
+        self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0 if zeros_only else draft_token_ids
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

@@ -37,7 +37,7 @@ class _Bucketer:
         self.warmed_up = True
 
 
-def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
+def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS, num_spec_tokens=0):
     # NONE keeps warmup off the attention recorder, which this file does not
     # exercise and which needs a real KV cache.
     compilation_config = types.SimpleNamespace(
@@ -59,13 +59,15 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
     runner._spyre_device = torch.device("cpu")
     runner.spyre_shape_bucketer = _Bucketer(list(bucket_sizes))
     runner.max_num_reqs = max_num_reqs
+    runner.num_spec_tokens = num_spec_tokens
 
     body_rows: list[int] = []
     projected_rows: list[int] = []
 
     def dummy_run(size, *args, **kwargs):
         body_rows.append(size)
-        return None, torch.zeros(size, HIDDEN, dtype=torch.float16)
+        # Upstream's dummy batch samples one row per dummy request.
+        return None, torch.zeros(min(size, max_num_reqs), HIDDEN, dtype=torch.float16)
 
     def dummy_sampler_run(hidden_states):
         projected_rows.append(hidden_states.shape[0])
@@ -111,6 +113,14 @@ def test_a_max_num_reqs_below_every_bucket_still_warms_one_width():
     runner.warming_up_model()
 
     assert projected_rows == [4]
+
+
+def test_a_speculative_verify_widens_the_projected_rows():
+    """A verify step samples every draft plus a bonus row per request."""
+    runner, _, projected_rows = _runner(max_num_reqs=4, num_spec_tokens=3)
+    runner.warming_up_model()
+
+    assert sorted(projected_rows) == [1, 2, 4, 8, 16]
 
 
 def test_warmup_marks_the_bucketer_warmed():
