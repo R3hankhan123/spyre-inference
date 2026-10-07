@@ -135,11 +135,11 @@ def test_log_space_gumbel_matches_softmax_draw(rows: int) -> None:
 
 
 def test_runner_installs_spyre_topk_sampler() -> None:
-    """The runner's __init__ installs SpyreSampler -- guards the swap itself."""
+    """The runner's __init__ patches upstream's Sampler in place."""
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
-    from spyre_inference.v1.sample.sampler import SpyreSampler
+    from spyre_inference.v1.sample.sampler import greedy_sample
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
     vllm_config = VllmConfig(
@@ -153,5 +153,5 @@ def test_runner_installs_spyre_topk_sampler() -> None:
         compilation_config=CompilationConfig(custom_ops=["all"]),
     )
     runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
-    assert type(runner.sampler) is SpyreSampler
+    assert runner.sampler.greedy_sample is greedy_sample
     assert type(runner.sampler.topk_topp_sampler) is SpyreTopKTopPSampler

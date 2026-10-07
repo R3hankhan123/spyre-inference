@@ -18,7 +18,6 @@
 #include "cpu_types.hpp"
 
 #include <torch/all.h>
-#include <torch/library.h>
 
 #include <cmath>
 #include <cstdint>
@@ -26,13 +25,11 @@
 
 namespace {
 
-// Fused Gumbel-max kernel: argmax_i(logit_i + g_i) with g_i ~ Gumbel(0, 1) is
-// distributed as softmax(logits). The noise is generated per element from a
-// counter-based hash of (seed, i), so every row gets its own stream and seeded
-// requests reproduce. (A shared precomputed table, as in vLLM, restricts each
-// row to 2^20 noise windows and leaves much of a large vocab unreachable.)
-
+// Gumbel-max: argmax_i(logit_i + g_i) with g_i ~ Gumbel(0, 1) matches
+// softmax. Noise is SplitMix64(seed, i), so tokens are independent and
+// consecutive seeds are not a 1-token table shift (vllm#59786).
 constexpr uint64_t SPLITMIX_GAMMA = 0x9E3779B97F4A7C15ULL;
+constexpr double GUMBEL_MAX = 37.5;  // 53-bit u in (0,1) => -log(-log u) < 37.5
 
 static inline uint64_t splitmix64(uint64_t z) {
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -40,41 +37,70 @@ static inline uint64_t splitmix64(uint64_t z) {
   return z ^ (z >> 31);
 }
 
-// u in (0, 1) from 53 random bits, so -log(-log u) <= 54 ln 2 < GUMBEL_MAX.
-constexpr double GUMBEL_MAX = 37.5;
+static inline uint64_t noise_bits(uint64_t key, int64_t i) {
+  return splitmix64(key + uint64_t(i + 1) * SPLITMIX_GAMMA) >> 11;
+}
+
+static inline double gumbel_from_bits(uint64_t bits) {
+  const double u = (double(bits) + 0.5) * 0x1.0p-53;
+  return -std::log(-std::log(u));
+}
+
+static void fused_gumbel_argmax_row(int64_t* __restrict__ output,
+                                    const float* __restrict__ row,
+                                    uint64_t seed, int64_t vocab_size) {
+  const uint64_t key = splitmix64(seed);
+
+  // The first unmasked token seeds the running best; an all -inf row gives 0.
+  int64_t first = 0;
+  while (first < vocab_size &&
+         row[first] == -std::numeric_limits<float>::infinity())
+    ++first;
+  if (first == vocab_size) {
+    *output = 0;
+    return;
+  }
+
+  // Compare in (logit, noise) space: x + g > best_x + best_g is
+  // (x - best_x) + g > best_g. Adding g into a 1e38 logit loses it in
+  // double ULP, so ties at the float max would always keep the lower index.
+  double best_logit = row[first];
+  double best_g = gumbel_from_bits(noise_bits(key, first));
+  int64_t best_idx = first;
+  for (int64_t i = first + 1; i < vocab_size; ++i) {
+    const double dx = double(row[i]) - best_logit;
+    // Exact pruning: the noise is bounded; also skips every -inf.
+    if (dx + GUMBEL_MAX <= best_g) continue;
+    const uint64_t bits = noise_bits(key, i);
+    // Wins iff -log u < exp(dx - best_g); -log u >= 1 - u rejects most
+    // tokens with one exp instead of two logs.
+    const double one_minus_u =
+        (double((1ULL << 53) - 1 - bits) + 0.5) * 0x1.0p-53;
+    if (one_minus_u >= std::exp(dx - best_g)) continue;
+    const double g = gumbel_from_bits(bits);
+    if (dx + g > best_g) {
+      best_logit = row[i];
+      best_g = g;
+      best_idx = i;
+    }
+  }
+  *output = best_idx;
+}
 
 static void fused_gumbel_argmax_kernel(int64_t* __restrict__ output,
                                        const float* __restrict__ logits,
                                        const int64_t* __restrict__ seeds,
                                        const int64_t batch_size,
                                        const int64_t vocab_size) {
+  if (batch_size <= 0) return;
+  if (batch_size == 1) {
+    fused_gumbel_argmax_row(output, logits, uint64_t(seeds[0]), vocab_size);
+    return;
+  }
 #pragma omp parallel for schedule(static)
   for (int64_t b = 0; b < batch_size; ++b) {
-    const float* row = logits + b * vocab_size;
-    const uint64_t key = splitmix64(static_cast<uint64_t>(seeds[b]));
-
-    double best_score = -std::numeric_limits<double>::infinity();
-    int64_t best_idx = 0;
-    for (int64_t i = 0; i < vocab_size; ++i) {
-      const double x = row[i];
-      // Exact pruning: the noise is bounded, so a token this far below the
-      // running best cannot win. Skips every -inf left by top-k/top-p.
-      if (x + GUMBEL_MAX <= best_score) continue;
-      const uint64_t bits =
-          splitmix64(key + static_cast<uint64_t>(i + 1) * SPLITMIX_GAMMA) >> 11;
-      // Wins iff -log u < exp(x - best); -log u >= 1 - u rejects most tokens
-      // with one exp instead of two logs.
-      const double one_minus_u =
-          (static_cast<double>((1ULL << 53) - 1 - bits) + 0.5) * 0x1.0p-53;
-      if (one_minus_u >= std::exp(x - best_score)) continue;
-      const double u = (static_cast<double>(bits) + 0.5) * 0x1.0p-53;
-      const double score = x - std::log(-std::log(u));
-      if (score > best_score) {
-        best_score = score;
-        best_idx = i;
-      }
-    }
-    output[b] = best_idx;
+    fused_gumbel_argmax_row(output + b, logits + b * vocab_size,
+                            uint64_t(seeds[b]), vocab_size);
   }
 }
 
@@ -138,6 +164,7 @@ torch::Tensor fused_gumbel_argmax(const torch::Tensor& logits,
   TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, vocab]");
   TORCH_CHECK(logits.scalar_type() == torch::kFloat32,
               "logits must be float32");
+  TORCH_CHECK(logits.size(1) > 0, "vocab_size must be positive");
   TORCH_CHECK(seeds.device().is_cpu(), "seeds must be a CPU tensor");
   TORCH_CHECK(seeds.scalar_type() == torch::kInt64, "seeds must be int64");
   TORCH_CHECK(seeds.dim() == 1 && seeds.size(0) == logits.size(0),
