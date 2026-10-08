@@ -128,12 +128,28 @@ runs:
       run: |
         find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
+    # uv keys the editable spyre-inference build on paths and mtimes, so every fresh checkout rebuilds the csrc/ kernels; setup.py's SPYRE_EXT_CACHE_DIR reuses them by content hash instead.
+    - name: Key the csrc/ kernel cache on this machine's arch
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      id: ext-arch
+      shell: bash
+      run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore built csrc/ kernels
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      id: ext-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/spyre-ext-cache
+        key: spyre-ext-${{ steps.ext-arch.outputs.arch }}-${{ hashFiles('csrc/**', 'cmake/**', 'CMakeLists.txt', 'setup.py', 'pyproject.toml') }}
+
     # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
     - name: Build spyre-inference
       if: ${{ inputs.use_prebaked_image != 'true' }}
       shell: bash
       env:
         TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        SPYRE_EXT_CACHE_DIR: ${{ runner.temp }}/spyre-ext-cache
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -148,6 +164,13 @@ runs:
         # Print the resolved torch install for log visibility.
         uv pip show torch
         uv pip freeze
+
+    - name: Save built csrc/ kernels
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.is_merge_group != 'true' && steps.ext-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/spyre-ext-cache
+        key: ${{ steps.ext-cache.outputs.cache-primary-key }}
 
     # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
     - name: Activate the freshly-built venv

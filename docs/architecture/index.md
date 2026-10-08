@@ -486,8 +486,9 @@ fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts t
 for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
 large share of each decode step.
 
-`SpyreModelRunner` patches upstream's `Sampler` in place (`install_spyre_sampler` in
-`v1/sample/sampler.py`), so every holder of it, the rejection sampler included, samples the
+`SpyreModelRunner` patches upstream's `Sampler` in place after construction, pointing its
+greedy draw at `greedy_sample` (`v1/sample/sampler.py`) and its random draw at
+`SpyreTopKTopPSampler`, so every holder of it, the rejection sampler included, samples the
 same way. That brings back the CPU kernels and drops the full-vocabulary sort:
 
 - **Random draw** — `SpyreTopKTopPSampler.forward_native` calls

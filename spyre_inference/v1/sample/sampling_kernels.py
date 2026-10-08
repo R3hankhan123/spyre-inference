@@ -26,7 +26,7 @@ try:
     else:
         import spyre_inference._C  # noqa: F401  # ty: ignore[unresolved-import]
     _HAS_SAMPLING_KERNELS = True
-except ImportError as e:
+except (ImportError, AttributeError) as e:
     _HAS_SAMPLING_KERNELS = False
     init_logger(__name__).warning(
         "Failed to import the sampling kernels extension (spyre_inference._C): %s. "

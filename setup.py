@@ -17,10 +17,14 @@
 Metadata lives in pyproject.toml. Supported hosts: x86_64, ppc64le, s390x.
 """
 
+import hashlib
+import importlib.metadata
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 from setuptools import Extension, setup
@@ -39,8 +43,10 @@ class cmake_build_ext(build_ext):
         # The kernels are optional: without them the samplers fall back to
         # PyTorch ops, so a failed build must not fail the install.
         try:
-            self._build_with_cmake()
-        except (OSError, subprocess.CalledProcessError) as e:
+            if not self._restore_from_cache():
+                self._build_with_cmake()
+                self._store_in_cache()
+        except (OSError, ImportError, subprocess.CalledProcessError) as e:
             cmake_failed = isinstance(e, subprocess.CalledProcessError)
             why = "see the CMake output above" if cmake_failed else e
             print(
@@ -51,6 +57,50 @@ class cmake_build_ext(build_ext):
             )
             # setuptools copies and lists outputs from this list; nothing was built.
             self.extensions = []
+
+    # SPYRE_EXT_CACHE_DIR keys built extensions on a hash of their inputs, so CI
+    # can reuse them across fresh checkouts (uv's own cache keys on paths/mtimes).
+    def _cache_entry(self) -> Path | None:
+        cache_dir = os.environ.get("SPYRE_EXT_CACHE_DIR")
+        if not cache_dir:
+            return None
+        h = hashlib.sha256()
+        inputs = [ROOT / "CMakeLists.txt", ROOT / "setup.py"]
+        inputs += sorted(p for d in ("cmake", "csrc") for p in (ROOT / d).rglob("*") if p.is_file())
+        for path in inputs:
+            h.update(str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes())
+        for part in (
+            importlib.metadata.version("torch"),
+            platform.machine(),
+            sysconfig.get_config_var("EXT_SUFFIX"),
+            os.environ.get("CMAKE_BUILD_TYPE", "Debug" if self.debug else "RelWithDebInfo"),
+            os.environ.get("CMAKE_ARGS", ""),
+        ):
+            h.update(str(part).encode() + b"\0")
+        return Path(cache_dir) / h.hexdigest()[:16]
+
+    def _outputs(self) -> list[Path]:
+        return [Path(self.get_ext_fullpath(ext.name)) for ext in self.extensions]
+
+    def _restore_from_cache(self) -> bool:
+        entry = self._cache_entry()
+        if entry is None or not all((entry / out.name).is_file() for out in self._outputs()):
+            return False
+        for out in self._outputs():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(entry / out.name, out)
+        print(f"Reused cached spyre-inference kernels from {entry}")
+        return True
+
+    def _store_in_cache(self) -> None:
+        entry = self._cache_entry()
+        if entry is None:
+            return
+        entry.mkdir(parents=True, exist_ok=True)
+        for out in self._outputs():
+            tmp = entry / f".{out.name}.tmp"
+            shutil.copy2(out, tmp)
+            os.replace(tmp, entry / out.name)
 
     def _build_with_cmake(self) -> None:
         build_temp = Path(self.build_temp).resolve()
@@ -67,9 +117,10 @@ class cmake_build_ext(build_ext):
         subprocess.check_call(["cmake", str(ROOT), *cmake_args], cwd=build_temp)
 
         targets = [ext.name.removeprefix("spyre_inference.") for ext in self.extensions]
+        # Two sources per target, so more jobs only oversubscribe a shared runner.
+        num_jobs = os.environ.get("MAX_JOBS") or str(2 * len(targets))
         subprocess.check_call(
-            ["cmake", "--build", ".", f"-j={os.cpu_count() or 1}"]
-            + [f"--target={t}" for t in targets],
+            ["cmake", "--build", ".", f"-j={num_jobs}"] + [f"--target={t}" for t in targets],
             cwd=build_temp,
         )
 
