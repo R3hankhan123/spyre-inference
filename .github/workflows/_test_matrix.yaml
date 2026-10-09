@@ -304,8 +304,9 @@ jobs:
   # It also owns the changed-files detection the test jobs gate on.
   build_kernels:
     name: Build csrc/ sampling kernels
-    # Same pool and image as the x86_64 test configs, so compiler, glibc and Python match.
-    runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
+    # Same image as the x86_64 test configs, so compiler, glibc and Python match. A compile needs
+    # no card, so it takes the card-less pool, which only carries the standing image label.
+    runs-on: ${{ fromJSON(format('["x86_64","{0}","linux","{1}"]', (inputs.runner_label || github.event_name == 'merge_group') && 'spyre_pf_x1' || 'spyre_pf_x0', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 30
     env:
       STORAGE_1_DIR: /storage-1/spyre-inference
