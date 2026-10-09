@@ -307,6 +307,8 @@ jobs:
     # Same pool and image as the x86_64 test configs, so compiler, glibc and Python match.
     runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 30
+    env:
+      STORAGE_1_DIR: /storage-1/spyre-inference
     outputs:
       src_changed: ${{ steps.changed-src-files.outputs.any_changed }}
     steps:
@@ -375,9 +377,16 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          # Own key: the test jobs' shared uv cache must not be won by this job's slimmer one.
-          enable-cache: true
-          cache-suffix: kernels-build
+          enable-cache: false
+
+      # Own root, keyed on pyproject.toml ([build-system] requires): this job runs before every
+      # test job, so saving into .cache/uv would publish its slimmer cache under their key first.
+      - name: uv cache (NFS)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv-kernels
+          key-files: pyproject.toml
 
       # setup.py only warns on a failed build (the samplers fall back to PyTorch), so check
       # the wheel actually carries the extensions and fail here.
