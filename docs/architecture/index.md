@@ -142,7 +142,19 @@ Two adaptations worth knowing:
   it never needs that.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
-  since the device cannot hold both layouts at once. Tensor parallelism needs nothing
+  since the device cannot hold both layouts at once.
+  With `SPYRE_MOE_GATHER_SPLIT=N` (default 4) that relayout also cuts each expert into `N`
+  stick-aligned slices along `H` — gate/up `[E·N, H/N, M]`, down `[E·N, M, H/N]` — on the host,
+  since a gather from a view of the device stack does not lower. A gather divides across cores
+  only along its index entries, so a token's `top_k` whole experts keep at most `top_k` cores
+  busy; the gathered form gathers `top_k·N` slices instead, summing gate/up's partial products
+  and concatenating down's outputs. The all-expert form reads the same sliced stacks at TP=1
+  (down as one batched matmul) and TP=2 (each expert's down rebuilt whole per trip); from TP=4
+  neither beats the unsliced loop, so those layers keep an unsliced copy for it. A layer whose
+  all-expert form reads sliced stacks keeps the opaque op at every batch size, so only the
+  compiled regions run that loop. A split that does not cut `H` into whole sticks falls back
+  to whole experts. Indexing a loop tile per slice would give every TP one form, but it reads
+  wrong rows today (torch-spyre#5311). Tensor parallelism needs nothing
   further: upstream shards each expert's intermediate dim, so the forms just see a
   narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
   `MoERunner` all-reduces the per-rank partial sums. Each model's own adaptation module

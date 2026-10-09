@@ -1372,3 +1372,48 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 16. Indexing a for_each_tile loop tile
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#5311: indexing a for_each_tile loop tile inside the body (tile[j]) "
+        "reads the wrong rows. When this XPASS-es, follow the TODO in "
+        "spyre_inference.moe._moe_persistent_sliced: index down's slices there, and use "
+        "the sliced prefill for TP > 2 too."
+    ),
+)
+def test_spyre_for_each_tile_tile_index(spyre_device):
+    """Each step multiplies by its tile's rows one at a time and concatenates them."""
+    from torch_spyre._inductor.wsr import for_each_tile
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    tokens, steps, hidden, inter, rows = 32, 8, 256, 128, 4
+    torch.manual_seed(0)
+    a = torch.randn(tokens, inter, dtype=torch.float16) * 0.5
+    table = torch.randn(steps * rows, inter, hidden // rows, dtype=torch.float16) * 0.05
+
+    def fn(a, table):
+        def body(acc, tiles):
+            a, tile = tiles
+            return acc + torch.cat([a @ tile[j] for j in range(rows)], dim=-1), None
+
+        result, _ = for_each_tile(
+            body, (a, table), dims=(None, 0), tile_size=rows, init=a.new_zeros(tokens, hidden)
+        )
+        return result
+
+    compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+    actual = compiled(a.to(spyre_device), dma_moe_expert_weight_to_spyre(table.contiguous()))
+
+    # Row j of step s is table[s * rows + j]; its product fills output sticks j.
+    blocks = table.float().view(steps, rows, inter, hidden // rows)
+    expected = sum(
+        torch.cat([a.float() @ blocks[s, j] for j in range(rows)], dim=-1) for s in range(steps)
+    )
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)

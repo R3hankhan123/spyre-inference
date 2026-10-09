@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
+    SPYRE_MOE_GATHER_SPLIT: int = 4
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -117,6 +118,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
     # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
     "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")),
+    # Slices each routed expert is gathered as on the selected-expert path. A gather spreads
+    # over cores only along its index entries, so at "1" a token's top_k experts occupy at
+    # most top_k cores; "N" (default "4") gathers top_k * N stick-aligned slices instead. A
+    # value that does not cut hidden_size into whole sticks falls back to "1".
+    "SPYRE_MOE_GATHER_SPLIT": lambda: int(os.getenv("SPYRE_MOE_GATHER_SPLIT", "4")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

@@ -517,6 +517,7 @@ def test_moe_runner_traces_only_stick_aligned_batches():
     assert op_registry_oot["MoERunner"] is SpyreMoERunner
     runner = object.__new__(SpyreMoERunner)
     runner.moe_config = SimpleNamespace(in_dtype=torch.float16)
+    runner.routed_experts = SimpleNamespace()
     runner._shared_experts = None
     runner._select_forward()
     assert runner._entry_for(512) is moe_runner._moe_forward
@@ -524,6 +525,25 @@ def test_moe_runner_traces_only_stick_aligned_batches():
     runner._shared_experts = object()
     assert runner._entry_for(64) is moe_runner._moe_forward_shared
     assert runner._entry_for(3) is torch.ops.vllm.moe_forward_shared
+
+
+@pytest.mark.parametrize(
+    ("form", "traced"), [("batched", False), ("whole", False), ("unsliced", True)]
+)
+def test_moe_runner_keeps_a_sliced_prefill_layer_out_of_the_graph(form, traced):
+    """Only the compiled regions run the sliced prefill loop; an unsliced copy traces in-graph."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    from spyre_inference.moe import SpyreMoERunner
+
+    runner = object.__new__(SpyreMoERunner)
+    runner.moe_config = SimpleNamespace(in_dtype=torch.float16)
+    runner.routed_experts = SimpleNamespace(spyre_moe_prefill_form=form)
+    runner._shared_experts = None
+    runner._select_forward()
+
+    expected = moe_runner._moe_forward if traced else torch.ops.vllm.moe_forward
+    assert runner._entry_for(512) is expected
 
 
 def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypatch):
@@ -850,8 +870,10 @@ def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
 # A whole number of sticks, and a TP shard that lands mid-stick (704 // 2 = 352 for
 # gemma-4-26B-A4B, scaled down here).
 @pytest.mark.parametrize("inter", [INTER, INTER - 32])
-def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
+def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter, monkeypatch):
     """A model recipe may prepare down weights before generic relayout."""
+    # The unsliced layout; the sliced one is covered by the split tests below.
+    monkeypatch.setenv("SPYRE_MOE_GATHER_SPLIT", "1")
 
     from torch_spyre._C import get_elem_in_stick
 
@@ -894,3 +916,195 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     # The added lanes must be zero, which is what makes the widening inert.
     for padded in (gate[..., inter:], up[..., inter:], down[:, inter:]):
         assert not padded.count_nonzero()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+@pytest.mark.parametrize("routing", ["full_softmax", "topk_softmax"])
+def test_split_gather_matches_the_whole_expert_gather_on_host(num_tokens, routing):
+    """Slicing the stacks only re-associates the contractions, so the result is unchanged."""
+    from spyre_inference.moe import _moe_gathered, _moe_gathered_split, _split_offsets
+
+    torch.manual_seed(num_tokens)
+    split, stick = 2, 64
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float64)
+    logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float64)
+    gate, up = (torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float64) * 0.05 for _ in "gu")
+    down = torch.randn(EXPERTS, INTER, HIDDEN, dtype=torch.float64) * 0.05
+    routing_args = (TOP_K, stick, torch.float64, routing, "gelu_tanh")
+    # The cuts ``_to_spyre_sliced_weight`` makes, minus the device copy.
+    sliced = (
+        gate.reshape(EXPERTS * split, HIDDEN // split, INTER),
+        up.reshape(EXPERTS * split, HIDDEN // split, INTER),
+        down.reshape(EXPERTS, INTER, split, HIDDEN // split)
+        .transpose(1, 2)
+        .reshape(EXPERTS * split, INTER, HIDDEN // split),
+    )
+
+    expected = _moe_gathered(x, logits, gate, up, down, *routing_args)
+    actual = _moe_gathered_split(x, logits, *sliced, *routing_args, _split_offsets(split, stick))
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_split_gather_addresses_each_slice_of_each_routed_expert():
+    from spyre_inference.moe import _gather_indices, _split_offsets
+
+    addresses = _gather_indices(torch.tensor([[3, 7]]), 2, 64, _split_offsets(4, 64))
+
+    assert addresses.tolist() == [[12, 13, 14, 15, 28, 29, 30, 31]]
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(1, 1), (2, 2), (4, 4), (3, 1)],  # HIDDEN is four sticks: three slices would split one
+)
+def test_a_split_that_would_cut_a_stick_gathers_whole_experts(requested, expected):
+    from spyre_inference.moe import _gather_split
+
+    assert _gather_split(requested, HIDDEN, 64) == expected
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_split_gathered_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
+    """The sliced gather on the card: a slice view of the MoE layout must not fall back."""
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    from spyre_inference.moe import (
+        SpyreMoERecipe,
+        _gathered,
+        _gathered_tokens,
+        _split_offsets,
+        _to_spyre_sliced_weight,
+    )
+
+    host, _ = stick_aligned_moe_weights
+    split, stick = 2, get_elem_in_stick(torch.float16)
+    gen = torch.Generator().manual_seed(num_tokens)
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(num_tokens, STICK_EXPERTS, dtype=torch.float16, generator=gen)
+
+    def sliced(name):
+        return _to_spyre_sliced_weight(host[name], (), split, cut_free=name == "down")
+
+    layer = SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
+        spyre_moe_gate=sliced("gate"),
+        spyre_moe_up=sliced("up"),
+        spyre_moe_down=sliced("down"),
+        spyre_moe_stick=stick,
+        spyre_moe_route_dtype=torch.float16,
+        spyre_moe_split_offsets=_split_offsets(split, stick).to("spyre"),
+        spyre_moe_regions={},
+        top_k=TOP_K,
+    )
+    driver = _gathered if num_tokens == 1 else _gathered_tokens
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        region = torch.compile(driver, backend="inductor", fullgraph=True, dynamic=False)
+        actual = region(layer, x.to("spyre"), logits.to("spyre"))
+
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the split gather fell back to CPU: {fallbacks}"
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        host["scale"],
+        TOP_K,
+    )
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_sliced_persistent_expert_loop_matches_the_whole_expert_loop_on_host():
+    """Prefill reads the sliced stacks too, so the layer holds one copy of the experts."""
+    from spyre_inference.moe import _moe_persistent, _moe_persistent_sliced
+
+    torch.manual_seed(0)
+    tokens, experts, hidden, inter, split = 24, 6, 16, 24, 4
+    x = torch.randn(tokens, hidden)
+    gate = torch.randn(experts, hidden, inter)
+    up = torch.randn(experts, hidden, inter)
+    down = torch.randn(experts, inter, hidden)
+    route = torch.rand(tokens, experts, 1)
+    sliced = (
+        gate.reshape(experts * split, hidden // split, inter),
+        up.reshape(experts * split, hidden // split, inter),
+        down.reshape(experts, inter, split, hidden // split)
+        .transpose(1, 2)
+        .reshape(experts * split, inter, hidden // split),
+    )
+
+    expected = _moe_persistent(x, route, gate, up, down, "gelu_tanh")
+    for whole_down in (True, False):
+        actual = _moe_persistent_sliced(x, route, *sliced, "gelu_tanh", split, whole_down)
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("whole_down", [True, False], ids=["whole", "batched"])
+@pytest.mark.parametrize("num_tokens", [24, 32])
+def test_sliced_persistent_matches_dense_reference(moe_weights, num_tokens, whole_down):
+    """The prefill form over the sliced stacks, in the region sequence ``apply_monolithic`` uses."""
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
+    from torch_spyre._inductor.wsr.propagate_named_dims import reset as reset_named_dims
+
+    from spyre_inference.moe import (
+        _moe_persistent_routing,
+        _moe_persistent_sliced,
+        _name_sliced_persistent_dims,
+        _probs,
+        _to_spyre_sliced_weight,
+    )
+
+    host, _ = moe_weights
+    split, stick = 2, get_elem_in_stick(torch.float16)
+    pad = -host["gate"].shape[-1] % stick
+    gate = _to_spyre_sliced_weight(host["gate"], (0, pad), split, cut_free=False)
+    up = _to_spyre_sliced_weight(host["up"], (0, pad), split, cut_free=False)
+    down = _to_spyre_sliced_weight(
+        host["down"] * host["scale"].view(-1, 1, 1), (0, 0, 0, pad), split, cut_free=True
+    )
+    x, logits = _inputs(num_tokens)
+    x_dev = x.to("spyre")
+    identity = torch.eye(stick, dtype=torch.float16).to("spyre")
+
+    routing = torch.compile(
+        _moe_persistent_routing, backend="inductor", fullgraph=True, dynamic=False
+    )
+    probs = torch.compile(_probs, backend="inductor", fullgraph=True, dynamic=False)
+    experts = torch.compile(
+        _moe_persistent_sliced, backend="inductor", fullgraph=True, dynamic=False
+    )
+
+    with spyre_config.patch({"frontend_pool_allocation": True}):
+        route = routing(probs(logits.to("spyre"), logits.dtype), identity, TOP_K, stick)
+        _name_sliced_persistent_dims(x_dev, gate, up, down)
+        try:
+            with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):
+                actual = experts(x_dev, route, gate, up, down, "gelu_tanh", split, whole_down)
+        finally:
+            reset_named_dims()
+
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        host["scale"],
+        TOP_K,
+    )
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "form"), [(1, "batched"), (2, "whole"), (4, "unsliced"), (8, "unsliced")]
+)
+def test_prefill_reads_the_experts_in_the_form_measured_fastest_at_that_tp(tp_size, form):
+    from spyre_inference.moe import _prefill_form
+
+    assert _prefill_form(tp_size) == form
