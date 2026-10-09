@@ -17,14 +17,11 @@
 Metadata lives in pyproject.toml. Supported hosts: x86_64, ppc64le, s390x.
 """
 
-import hashlib
-import importlib.metadata
 import os
 import platform
-import shutil
 import subprocess
 import sys
-import sysconfig
+import zipfile
 from pathlib import Path
 
 from setuptools import Extension, setup
@@ -40,13 +37,16 @@ class CMakeExtension(Extension):
 
 class cmake_build_ext(build_ext):
     def build_extensions(self) -> None:
+        if self._extract_from_prebuilt_wheel():
+            return
         # The kernels are optional: without them the samplers fall back to
         # PyTorch ops, so a failed build must not fail the install.
         try:
-            if not self._restore_from_cache():
-                self._build_with_cmake()
-                self._store_in_cache()
-        except (OSError, ImportError, subprocess.CalledProcessError) as e:
+            self._build_with_cmake()
+        except (OSError, subprocess.CalledProcessError) as e:
+            # A previous build's .so would import as stale kernels; fall back instead.
+            for stale in [*self._outputs(), *(ROOT / "spyre_inference").glob("_C*.so")]:
+                stale.unlink(missing_ok=True)
             cmake_failed = isinstance(e, subprocess.CalledProcessError)
             why = "see the CMake output above" if cmake_failed else e
             print(
@@ -58,49 +58,34 @@ class cmake_build_ext(build_ext):
             # setuptools copies and lists outputs from this list; nothing was built.
             self.extensions = []
 
-    # SPYRE_EXT_CACHE_DIR keys built extensions on a hash of their inputs, so CI
-    # can reuse them across fresh checkouts (uv's own cache keys on paths/mtimes).
-    def _cache_entry(self) -> Path | None:
-        cache_dir = os.environ.get("SPYRE_EXT_CACHE_DIR")
-        if not cache_dir:
-            return None
-        h = hashlib.sha256()
-        inputs = [ROOT / "CMakeLists.txt", ROOT / "setup.py"]
-        inputs += sorted(p for d in ("cmake", "csrc") for p in (ROOT / d).rglob("*") if p.is_file())
-        for path in inputs:
-            h.update(str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes())
-        for part in (
-            importlib.metadata.version("torch"),
-            platform.machine(),
-            sysconfig.get_config_var("EXT_SUFFIX"),
-            os.environ.get("CMAKE_BUILD_TYPE", "Debug" if self.debug else "RelWithDebInfo"),
-            os.environ.get("CMAKE_ARGS", ""),
-        ):
-            h.update(str(part).encode() + b"\0")
-        return Path(cache_dir) / h.hexdigest()[:16]
-
     def _outputs(self) -> list[Path]:
         return [Path(self.get_ext_fullpath(ext.name)) for ext in self.extensions]
 
-    def _restore_from_cache(self) -> bool:
-        entry = self._cache_entry()
-        if entry is None or not all((entry / out.name).is_file() for out in self._outputs()):
+    # CI builds the kernels once per run (the build_kernels job) and hands its wheel to every
+    # test job via SPYRE_KERNELS_WHEEL_DIR. Only the compiled extensions are taken from it; the
+    # Python code comes from the checkout. A wheel without matching extensions (another
+    # Python ABI, say) falls back to building.
+    def _extract_from_prebuilt_wheel(self) -> bool:
+        wheel_dir = os.environ.get("SPYRE_KERNELS_WHEEL_DIR")
+        if not wheel_dir:
             return False
-        for out in self._outputs():
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(entry / out.name, out)
-        print(f"Reused cached spyre-inference kernels from {entry}")
+        try:
+            wheels = sorted(Path(wheel_dir).glob("spyre_inference-*.whl"))
+            if not wheels:
+                raise FileNotFoundError(f"no spyre_inference wheel in {wheel_dir}")
+            with zipfile.ZipFile(wheels[-1]) as whl:
+                members = {f"spyre_inference/{out.name}": out for out in self._outputs()}
+                if missing := set(members) - set(whl.namelist()):
+                    raise FileNotFoundError(f"{wheels[-1].name} lacks {sorted(missing)}")
+                for member, out in members.items():
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(whl.read(member))
+                    out.chmod(0o755)
+        except (OSError, zipfile.BadZipFile) as e:
+            print(f"WARNING: not using the prebuilt kernels ({e}); building.", file=sys.stderr)
+            return False
+        print(f"Using the prebuilt spyre-inference kernels from {wheels[-1].name}")
         return True
-
-    def _store_in_cache(self) -> None:
-        entry = self._cache_entry()
-        if entry is None:
-            return
-        entry.mkdir(parents=True, exist_ok=True)
-        for out in self._outputs():
-            tmp = entry / f".{out.name}.tmp"
-            shutil.copy2(out, tmp)
-            os.replace(tmp, entry / out.name)
 
     def _build_with_cmake(self) -> None:
         build_temp = Path(self.build_temp).resolve()

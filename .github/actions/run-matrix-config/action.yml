@@ -128,20 +128,15 @@ runs:
       run: |
         find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
-    # uv keys the editable spyre-inference build on paths and mtimes, so every fresh checkout rebuilds the csrc/ kernels; setup.py's SPYRE_EXT_CACHE_DIR reuses them by content hash instead.
-    - name: Key the csrc/ kernel cache on this machine's arch
+    # The build_kernels job built the kernels wheel once for this run; setup.py takes the compiled
+    # extensions from it (SPYRE_KERNELS_WHEEL_DIR) instead of compiling. A missing artifact fails
+    # here rather than falling back.
+    - name: Download kernels wheel
       if: ${{ inputs.use_prebaked_image != 'true' }}
-      id: ext-arch
-      shell: bash
-      run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
-
-    - name: Restore built csrc/ kernels
-      if: ${{ inputs.use_prebaked_image != 'true' }}
-      id: ext-cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/download-artifact@v4
       with:
-        path: ${{ runner.temp }}/spyre-ext-cache
-        key: spyre-ext-${{ steps.ext-arch.outputs.arch }}-${{ hashFiles('csrc/**', 'cmake/**', 'CMakeLists.txt', 'setup.py', 'pyproject.toml') }}
+        name: sampling-kernels-wheel
+        path: ${{ runner.temp }}/kernels-wheel
 
     # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
     - name: Build spyre-inference
@@ -149,7 +144,7 @@ runs:
       shell: bash
       env:
         TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
-        SPYRE_EXT_CACHE_DIR: ${{ runner.temp }}/spyre-ext-cache
+        SPYRE_KERNELS_WHEEL_DIR: ${{ runner.temp }}/kernels-wheel
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -165,12 +160,12 @@ runs:
         uv pip show torch
         uv pip freeze
 
-    - name: Save built csrc/ kernels
-      if: ${{ inputs.use_prebaked_image != 'true' && inputs.is_merge_group != 'true' && steps.ext-cache.outputs.cache-hit != 'true' }}
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/spyre-ext-cache
-        key: ${{ steps.ext-cache.outputs.cache-primary-key }}
+    # The kernel tests skip when the extension is absent, so a run that builds the workspace must check it here.
+    - name: Check the csrc/ kernels load
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      shell: bash
+      run: |
+        .venv/bin/python -c "from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels; assert has_sampling_kernels(), 'the sampling kernels did not build or load; see the Build spyre-inference step'"
 
     # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
     - name: Activate the freshly-built venv
