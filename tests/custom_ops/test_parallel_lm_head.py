@@ -170,8 +170,8 @@ def test_lm_head_fp8_config_accepted(tp_group):
     Fp8Config.get_quant_method returns None for ParallelLMHead (it only
     handles LinearBase/Attention), so upstream falls back to
     UnquantizedEmbeddingMethod, which we then replace with
-    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
-    of the checkpoint's quantization config.
+    SpyreUnquantizedLMHeadMethod. ``install_fp8_lm_head`` quantizes it after load,
+    once the body's linears are known to be FP8.
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -581,6 +581,87 @@ def test_projection_stays_eager_inside_an_enclosing_graph(tp_group, monkeypatch)
 
     assert out.shape == (3, 16)
     assert method.spyre_compiled_kernel is None
+
+
+def _loaded_head(vocab_size: int, embedding_dim: int):
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    layer.weight.data.copy_(torch.randn(layer.weight.shape, dtype=torch.float16) * 0.05)
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_lm_head_needs_fp8_body_linears(tp_group):
+    """An unquantized model keeps its fp16 head."""
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreUnquantizedLMHeadMethod,
+        install_fp8_lm_head,
+    )
+
+    head = _loaded_head(128, 64)
+    model = torch.nn.ModuleDict({"lm_head": head})
+    install_fp8_lm_head(model)
+
+    assert type(head.quant_method) is SpyreUnquantizedLMHeadMethod
+    assert head.padded_weight_t.dtype == torch.float16
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+@pytest.mark.parametrize("vocab_size", [49216, 51200])
+def test_fp8_lm_head_matches_reference(tp_group, monkeypatch, num_tokens, vocab_size):
+    """The FP8 head is QFP8WT on Spyre and tracks the fp16 projection.
+
+    49216 is padded to 51200, so the dropped pad columns are covered too.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    import types
+
+    from torch_spyre._C import ElementArrangement
+    from vllm.config import CompilationMode
+
+    from spyre_inference.custom_ops import lazy_compile, parallel_lm_head
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        install_fp8_lm_head,
+    )
+
+    # The FP8 ops lower only in a graph, so the head must compile its own.
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    torch.manual_seed(0)
+    embedding_dim = 128
+    head = _loaded_head(vocab_size, embedding_dim)
+    model = torch.nn.ModuleDict({"lm_head": head})
+    # Stands in for a body with FP8 linears.
+    monkeypatch.setattr(
+        parallel_lm_head, "_spyre_fp8_kernel", lambda m: object() if m is model else None
+    )
+    install_fp8_lm_head(model)
+
+    assert isinstance(head.quant_method, SpyreFp8LMHeadMethod)
+    assert head.padded_weight_t.device.type == "spyre"
+    layout = head.padded_weight_t.device_tensor_layout()
+    assert layout.element_arrangement == ElementArrangement.QFP8WT
+    assert head.weight_scale.shape == (1, head.padded_weight_t.shape[1])
+
+    head = head.to("spyre")
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
+    actual = head.quant_method.apply(head, x.to("spyre")).cpu().float()
+    expected = reference_lm_head(x, head.weight.data.cpu()).float()
+
+    assert actual.shape == (num_tokens, vocab_size)
+    # Activation and weight quantization together are a few percent; a wrong column
+    # order or scale is far off.
+    rel = ((actual - expected).norm() / expected.norm()).item()
+    assert rel < 0.05, f"relative error {rel:.4f}"
 
 
 @pytest.fixture

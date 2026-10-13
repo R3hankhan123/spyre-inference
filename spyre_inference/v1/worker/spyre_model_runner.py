@@ -744,6 +744,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Before the device move: the FP8 head is DMA'd as QFP8WT, which `.to` then skips.
+        from spyre_inference.custom_ops.parallel_lm_head import install_fp8_lm_head
+
+        install_fp8_lm_head(self.model)
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
         # Checkpoint FP8 is already QFP8WT. fp16 weights on an FP8 linear are
