@@ -1452,6 +1452,49 @@ def test_head_major_batched_decode_correctness(
 
 
 @pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # The long context sits mid-batch, so each group's rows are not contiguous.
+        pytest.param([(1, 128)] * 3 + [(1, 2048)] + [(1, 128)] * 4, id="decodes(7+1)"),
+        pytest.param(
+            [(1, 128)] * 3 + [(1, 2048)] + [(1, 128)] * 3 + [(64, 256)], id="decodes(6+1)+prefill"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_batched_decode_split_groups(
+    default_vllm_config,
+    monkeypatch,
+    batched_decode_calls,
+    seq_lens,
+    configure_compilation,
+    configure_device,
+):
+    """A long context gets its own batched call, and each call stores to its own rows."""
+    from spyre_inference.v1.attention import spyre_attn_bucketer
+
+    # The test config's 2048-token limit is too short for a split to pay for a real call.
+    monkeypatch.setattr(spyre_attn_bucketer, "DECODE_GROUP_OVERHEAD_ENTRIES", 0)
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+    assert len(batched_decode_calls) == 2, (
+        f"expected one batched call per group, got {len(batched_decode_calls)}"
+    )
+
+
+@pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,

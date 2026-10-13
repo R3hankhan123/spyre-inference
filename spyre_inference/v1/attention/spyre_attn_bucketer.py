@@ -67,6 +67,44 @@ def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     return blocks_per_chunk, num_chunks
 
 
+# One more batched decode call, priced in the padded (sequence, block) entries it would
+# have to save: about one sequence at the 256-block bucket. A first estimate from a TP4
+# Granite 8B profile, where a padded entry costs ~2.7us of device time per layer.
+DECODE_GROUP_OVERHEAD_ENTRIES = 256
+
+
+def split_decode_groups(decode_blocks: list[int], bucketer: SpyreAttnBucketer) -> list[list[int]]:
+    """Partition the decode sequences into batched decode calls: one, or two by context length.
+
+    One call pads every sequence to the bucket of the longest, so a single long context
+    makes the whole batch pay for it. Two calls, short contexts and long, each pad to their
+    own bucket. Splits when that saves more padded entries than the extra call costs.
+    """
+
+    def cost(group: list[int]) -> int | None:
+        b_seqs = bucketer.find_sequence_bucket(len(group))
+        b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[s] for s in group))
+        if b_seqs is None or b_blocks is None:
+            return None
+        blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
+        return b_seqs * blocks_per_chunk * num_chunks
+
+    seqs = list(range(len(decode_blocks)))
+    best, best_cost = [seqs], cost(seqs)
+    if best_cost is None:
+        return best
+    by_len = sorted(seqs, key=lambda s: decode_blocks[s])
+    for k in range(1, len(by_len)):
+        short, long = sorted(by_len[:k]), sorted(by_len[k:])
+        short_cost, long_cost = cost(short), cost(long)
+        if short_cost is None or long_cost is None:
+            continue
+        split_cost = short_cost + long_cost + DECODE_GROUP_OVERHEAD_ENTRIES
+        if split_cost < best_cost:
+            best, best_cost = [short, long], split_cost
+    return best
+
+
 @dataclass(frozen=True)
 class SpyreAttnBucket:
     """One recordable per-sequence attention kernel variant.

@@ -154,6 +154,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     """
 
     supports_fp8_kv_cache: ClassVar[bool] = True
+    supports_decode_groups: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -311,6 +312,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             ),
             device=device,
         )
+        attn_metadata.out_row_ids_dev = convert(attn_metadata.out_row_ids_cpu, device=device)
 
     def _run_batched_decode(
         self,
@@ -324,6 +326,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        out_row_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
@@ -344,6 +347,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                out_row_ids=out_row_ids,
             )
 
     def _run_page_attn(
