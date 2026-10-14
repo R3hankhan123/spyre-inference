@@ -652,6 +652,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_buffer_rows = 0
         # (extent, width, query_lens) on the rectangular path; None on the ragged one.
         self._encoder_grid: tuple[int, int, list[int]] | None = None
+        # Set while warmup runs dummies on published decode tensors (_warm_traced_decode).
+        self._keep_decode_grid = False
         # Warmup only; see _warm_encoder_inline_paths.
         self._forced_encoder_rect: tuple[int, int] | None = None
         self._force_encoder_ragged = False
@@ -1005,7 +1007,55 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
+        self._warm_traced_decode()
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _warm_traced_decode(self) -> None:
+        """One block graph per batched-decode variant an all-decode step traces attention into.
+
+        The body warmup above compiles each token bucket with attention behind the opaque
+        op; a step whose decode tensors are published (``SlotMapping.publish_decode``)
+        specialises the block graph on their shapes instead. A decode step's token bucket is
+        its sequence bucket, so only sequence buckets that are also body buckets are reachable.
+        """
+        assert self.spyre_shape_bucketer is not None
+        holders = {}
+        for builder in self._attn_metadata_builders().values():
+            if builder._slot_mapping.trace_decode:
+                holders[id(builder._slot_mapping)] = builder
+        if len(holders) > 1:
+            # Each holder's tensors would multiply the others' variants in one block graph.
+            for builder in holders.values():
+                builder._slot_mapping.trace_decode = False
+            logger.info("Decode attention stays behind the opaque op: several KV-cache groups.")
+            return
+        if not holders:
+            return
+        (builder,) = holders.values()
+        bodies = set(self.spyre_shape_bucketer.bucket_sizes)
+        variants = [
+            v for v in builder.attn_bucketer.batched_decode_variants() if v.num_seqs in bodies
+        ]
+        logger.info(
+            "Warming up to %d block graph(s) with decode attention traced in...", len(variants)
+        )
+        t0 = time.time()
+        warmed = 0
+        self._keep_decode_grid = True
+        try:
+            with _set_spyre_compilation_settings(self.vllm_config):
+                for bucket in variants:
+                    builder.build_for_batched_decode_variant(bucket)
+                    # can_trace_decode declined it (core cap or page bound): stays opaque.
+                    if builder._slot_mapping.decode is None:
+                        continue
+                    self._dummy_run(bucket.num_seqs)
+                    warmed += 1
+        finally:
+            self._keep_decode_grid = False
+            builder._slot_mapping.decode = None
+        logger.info("Warmed %d traced-decode block graph(s) in %.3fs.", warmed, time.time() - t0)
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
@@ -1322,7 +1372,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # pin this override to upstream's parameter order across vLLM bumps.
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
-            attn_layer.publish_null_slots(num_tokens)
+            attn_layer.publish_null_slots(num_tokens, keep_decode=self._keep_decode_grid)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

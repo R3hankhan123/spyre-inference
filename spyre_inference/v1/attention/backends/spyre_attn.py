@@ -938,6 +938,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             **(groups[0] if groups else {}),
         )
         metadata.decode_groups = [dataclasses.replace(metadata, **g) for g in groups[1:]]
+        # After decode_groups: a split step keeps attention behind the opaque op.
+        self._slot_mapping.publish_decode(metadata)
         return metadata
 
     def _plan_batched_decode(

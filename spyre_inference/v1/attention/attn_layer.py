@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre ``Attention.forward``: the KV write is traced, the attention core stays opaque.
+"""Spyre ``Attention.forward``: the KV write is traced, the attention core mostly opaque.
 
 ``install()``, called from the attention metadata builder, binds the forward below onto
 each eligible layer instance; every other ``Attention`` keeps upstream's forward and its
-``unified_kv_cache_update`` op. The core must stay opaque: its per-sequence Python loop
-cannot be captured with ``fullgraph=True``.
+``unified_kv_cache_update`` op. The core stays opaque wherever its per-sequence Python loop
+runs, which cannot be captured with ``fullgraph=True``. An all-decode step the batched
+kernel serves in one call is the exception: the builder publishes its tensors on the slot
+holder, and the forward traces the kernel into the block graph, saving the op's launches.
 """
 
 import types
@@ -46,6 +48,14 @@ class SlotMapping:
         self._device: torch.device | None = None
         # One tensor, or one per KV head: whatever the impl's KV store indexes by.
         self.slots: torch.Tensor | list[torch.Tensor] | None = None
+        # This step's batched-decode device tensors when its attention is traced in, else
+        # None: (rep_row_ids, chunk_page_ids, mask_by_chunk, out_row_ids). Their shapes are
+        # what the block graph specialises on, one variant per (seq bucket, block bucket).
+        self.decode: tuple[torch.Tensor, ...] | None = None
+        self.trace_decode = bool(layers) and all(
+            hasattr(layer.impl, "decode_in_graph") and layer.impl._batched_decode_supported()  # ty: ignore[possibly-missing-attribute,call-non-callable]
+            for layer in layers
+        )
 
     def _resolve_device(self) -> torch.device | None:
         if self._device is None:
@@ -71,7 +81,29 @@ class SlotMapping:
             return
         self.slots = self._write_index(slot_mapping.clamp(min=_NULL_SLOT), device)
 
-    def publish_null(self, num_tokens: int) -> None:
+    def publish_decode(self, attn_metadata) -> None:
+        """Publish an all-decode step's batched-decode tensors for the traced forward."""
+        self.decode = None
+        device = self._resolve_device() if self.trace_decode else None
+        if device is None:
+            return
+        layer = self._layers[0]
+        impl = layer.impl
+        if not impl.can_trace_decode(attn_metadata, layer.kv_cache[0].shape[0]):  # ty: ignore[call-non-callable]
+            return
+        if attn_metadata.rep_row_ids_dev is None:
+            # Also what the opaque path reads, so a forward that falls through mirrors nothing.
+            impl._mirror_batched_decode_indices(attn_metadata, device)  # ty: ignore[call-non-callable]
+        self.decode = (
+            attn_metadata.rep_row_ids_dev,
+            attn_metadata.chunk_page_ids_dev,
+            attn_metadata.mask_by_chunk_dev,
+            attn_metadata.out_row_ids_dev,
+        )
+
+    def publish_null(self, num_tokens: int, keep_decode: bool = False) -> None:
+        if not keep_decode:
+            self.decode = None
         device = self._resolve_device()
         if device is None:
             return
@@ -83,14 +115,15 @@ class SlotMapping:
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()
 
 
-def publish_null_slots(num_tokens: int) -> None:
+def publish_null_slots(num_tokens: int, keep_decode: bool = False) -> None:
     """Point every token at the null block ahead of a run that builds no metadata.
 
     Warmup would otherwise trace a second graph without the KV write, and a dummy run
-    after real inference would scatter into whichever step's slots ran last.
+    after real inference would scatter into whichever step's slots ran last. The traced
+    decode tensors are cleared too, unless warmup published them for this very run.
     """
     for holder in _holders:
-        holder.publish_null(num_tokens)
+        holder.publish_null(num_tokens, keep_decode)
 
 
 def _spyre_attention_forward(
@@ -116,7 +149,8 @@ def _spyre_attention_forward(
         value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
     dep = None
-    slots = cast(SlotMapping, self.spyre_slots).slots
+    holder = cast(SlotMapping, self.spyre_slots)
+    slots = holder.slots
     if slots is not None and key is not None and value is not None:
         # `dep` makes "scatter before read" a real data dependency, which is otherwise
         # invisible because the op reaches its cache through the forward context.
@@ -132,6 +166,16 @@ def _spyre_attention_forward(
     else:
         q_in, out_buf = buffers
         q_in[:rows] = query
+
+    decode = holder.decode
+    traced = dep is not None and buffers is not None and decode is not None
+    if traced and rows == decode[-1].shape[0]:  # ty: ignore[not-subscriptable]
+        # Same buffers, and so the same layouts, as the opaque path's batched kernel.
+        self.impl.decode_in_graph(  # ty: ignore[call-non-callable]
+            q_in, self.impl.kv_slot_views(self.kv_cache), *decode, out_buf
+        )
+        output.copy_(out_buf[:rows])
+        return output.view(-1, hidden_size)
 
     torch.ops.vllm.unified_attention_with_output(
         q_in,  # ty: ignore[invalid-argument-type]

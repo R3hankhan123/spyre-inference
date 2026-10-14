@@ -350,6 +350,62 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out_row_ids=out_row_ids,
             )
 
+    def can_trace_decode(self, attn_metadata: "SpyreAttentionMetadata", num_pages: int) -> bool:
+        """Whether this step's attention can run inside the block graph (``decode_in_graph``).
+
+        Only an all-decode step the batched kernel serves in one call: a mixed step's
+        prefill needs the per-seq loop, and a split batch would make the block graph's
+        structure depend on the group shapes. A core-capped variant stays out too: the cap
+        is a compile-wide setting, and inside the block graph it would cap the linears.
+        """
+        if attn_metadata.decode_groups or attn_metadata.num_decode_seqs != attn_metadata.num_seqs:
+            return False
+        if not self._batched_decode_preconditions_met(attn_metadata, num_pages):
+            return False
+        b_seqs, blocks_per_chunk = attn_metadata.padded_num_seqs, attn_metadata.blocks_per_chunk
+        assert b_seqs is not None and blocks_per_chunk is not None
+        return not _lx_max_cores(b_seqs * blocks_per_chunk * self.num_kv_heads)
+
+    def decode_in_graph(
+        self,
+        query: torch.Tensor,
+        kv_rows: SpyrePagedKVCache,
+        rep_row_ids: torch.Tensor,
+        chunk_page_ids: torch.Tensor,
+        mask_by_chunk: torch.Tensor,
+        out_row_ids: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """The batched decode kernel, traced into the caller's graph rather than compiled apart.
+
+        Reads the pages through ``kv_rows``, the views the traced KV store just wrote, so the
+        read is ordered after the store by data dependency. ``query`` and ``out`` are the
+        staging buffers, as on the opaque path; each sequence's row lands at its
+        ``out_row_ids`` entry of ``out``.
+        """
+        b_seqs = out_row_ids.shape[0]
+        page_shape = (-1, self.num_kv_heads, self.block_size, self.head_size)
+        scale, v_args = self._read_scales()
+        return batched_decode_head_major_kernel(
+            query,
+            rep_row_ids,
+            kv_rows.k_pages.view(page_shape),
+            kv_rows.v_pages.view(page_shape),
+            chunk_page_ids,
+            mask_by_chunk,
+            scale,
+            b_seqs,
+            rep_row_ids.shape[0] // b_seqs,
+            self.num_kv_heads,
+            self.num_queries_per_kv,
+            self.block_size,
+            self.head_size,
+            self.logits_soft_cap,
+            out,
+            *v_args,
+            out_row_ids=out_row_ids,
+        )
+
     def _run_page_attn(
         self,
         query: torch.Tensor,
