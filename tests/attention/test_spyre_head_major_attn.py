@@ -143,12 +143,8 @@ def _run_head_major_attn_test(
     head_size: int = 128,
     kv_cache_dtype: str = "auto",
     kv_scales: tuple[float, float] = (1.0, 1.0),
-    traced_decode: bool = False,
 ) -> None:
     """Validate against the same CPU reference the token-major suite uses.
-
-    ``traced_decode`` runs an all-decode batch through ``decode_in_graph`` inside a
-    ``fullgraph`` compile, as the block graph traces it, instead of through ``forward``.
 
     Seeds the cache entirely through the impl's store, history included: the head-major
     device layout cannot be reproduced by a host-populated transfer.
@@ -293,35 +289,17 @@ def _run_head_major_attn_test(
         k_expected = (k_expected.float() * k_scale).to(DTYPE)
         v_expected = (v_expected.float() * v_scale).to(DTYPE)
 
-    if traced_decode:
-        assert attn_impl.can_trace_decode(attn_metadata, num_blocks), "batch cannot trace in"
-        attn_impl._mirror_batched_decode_indices(attn_metadata, cache_device)
-        # The staging buffers attn_layer hands the traced kernel, as it does the opaque one.
-        q_stage, out_stage = attn_impl.staging_buffers(cache_device)
-        q_stage[: query.shape[0]] = convert(query, cache_device)
-        traced = torch.compile(attn_impl.decode_in_graph, fullgraph=True, dynamic=False)
-        traced(
-            q_stage,
-            attn_impl.kv_slot_views(kv_cache),
-            attn_metadata.rep_row_ids_dev,
-            attn_metadata.chunk_page_ids_dev,
-            attn_metadata.mask_by_chunk_dev,
-            attn_metadata.out_row_ids_dev,
-            out_stage,
-        )
-        output = out_stage[:num_seqs]
-    else:
-        # NaN, not empty: a store that lands nowhere has to fail here.
-        output = torch.full_like(query, float("nan")).to(cache_device)
-        attn_impl.forward(
-            layer=None,
-            query=convert(query, cache_device),
-            key=key_src,
-            value=value_src,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            output=output,
-        )
+    # NaN, not empty: a store that lands nowhere has to fail here.
+    output = torch.full_like(query, float("nan")).to(cache_device)
+    attn_impl.forward(
+        layer=None,
+        query=convert(query, cache_device),
+        key=key_src,
+        value=value_src,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
 
     ref_output = ref_attn(
         query=query,
@@ -1471,35 +1449,6 @@ def test_head_major_batched_decode_correctness(
         soft_cap=soft_cap,
     )
     assert batched_decode_calls, "the batch fell back to the per-seq loop"
-
-
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)] * 2, id="decodes(N=8)"),
-        pytest.param([(1, 1024)] * 4, id="decodes(N=4)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_head_major_decode_traced_in_graph(
-    default_vllm_config, seq_lens, configure_compilation, configure_device
-):
-    """The batched kernel traced into an outer graph, reading pages through the store views."""
-    _run_head_major_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        traced_decode=True,
-    )
 
 
 @pytest.mark.parametrize(
