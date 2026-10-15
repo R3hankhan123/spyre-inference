@@ -592,3 +592,34 @@ def test_install_qfp8wt_rejects_cpu_fp16():
     kernel.process_weights_after_loading(layer)
     with pytest.raises(RuntimeError, match="on Spyre"):
         kernel.install_qfp8wt(layer)
+
+
+def test_row_parallel_weight_gathered_in_rank_order(monkeypatch):
+    """A layer that gathers its input gets every rank's K slice, concatenated in order."""
+    from types import SimpleNamespace
+
+    import vllm.distributed
+
+    from spyre_inference.custom_ops import fp8_linear_kernel
+
+    shards = [torch.full((2, 64), r + 1.0).to(torch.float8_e4m3fn) for r in range(4)]
+
+    def all_gather(out, shard, group=None):
+        assert group == "cpu"
+        for o, s in zip(out, shards):
+            o.copy_(s.view(torch.uint8))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tp_group", lambda: SimpleNamespace(world_size=4, cpu_group="cpu")
+    )
+    monkeypatch.setattr(fp8_linear_kernel, "_dma_checkpoint_qfp8wt", lambda w: w)
+
+    layer = torch.nn.Module()
+    layer.gathers_input = True
+    fp8_linear_kernel._gather_row_parallel_weight(layer, shards[0])
+    assert torch.equal(layer.weight_full.view(torch.uint8), torch.cat(shards).view(torch.uint8))
+
+    other = torch.nn.Module()
+    fp8_linear_kernel._gather_row_parallel_weight(other, shards[0])
+    assert not hasattr(other, "weight_full")

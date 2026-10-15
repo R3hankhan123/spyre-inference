@@ -26,6 +26,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -36,7 +37,14 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
+from .fp8_linear_kernel import _spyre_fp8_kernel
+
 logger = init_logger(__name__)
+
+# A row-parallel layer at least this many rows long all-gathers its input instead of
+# all-reducing its output. Below it, decode's few rows make the host-staged transfer's
+# fixed cost dominate, so moving fewer bytes does not pay for the larger local GEMM.
+_GATHER_INPUT_MIN_ROWS = 256
 
 # torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
 # full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
@@ -197,7 +205,39 @@ class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnP
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
 class SpyreRowParallelLinear(_SpyreTransposedLinearMixin, RowParallelLinear):
-    """OOT RowParallelLinear (e.g. o_proj, down_proj) storing `Wᵀ`."""
+    """OOT RowParallelLinear (e.g. o_proj, down_proj) storing `Wᵀ`.
+
+    TP collectives cross the host, so their cost is the bytes each rank moves. An
+    all-reduce of the ``[T, N]`` output moves ``4·T·N`` (fp16 out, sum back), and an
+    all-gather of the ``[T, K / tp]`` input ``2·T·K``. When ``K < 2·N`` (o_proj, not
+    down_proj) and the FP8 kernel holds the full weight (``weight_full``), a long
+    enough input is gathered and the whole GEMM runs on every rank.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gathers_input = (
+            self.tp_size > 1
+            and self.reduce_results
+            and self.input_is_parallel
+            and self.input_size < 2 * self.output_size
+        )
+
+    def forward(self, input_):
+        weight_full = getattr(self, "weight_full", None)
+        rows = input_.numel() // input_.shape[-1]
+        # A trace-time branch: each compiled token bucket takes one path.
+        if weight_full is None or rows < _GATHER_INPUT_MIN_ROWS:
+            return super().forward(input_)
+        kernel = _spyre_fp8_kernel(self)
+        assert kernel is not None, "weight_full is only set by SpyreFp8LinearKernel"
+        x = tensor_model_parallel_all_gather(input_, dim=-1)
+        # Every rank now holds the whole output, so each adds the whole bias.
+        bias = None if self.skip_bias_add else self.bias
+        output = kernel.apply_fp8(x, weight_full, self.weight_scale, bias)
+        if not self.return_bias:
+            return output
+        return output, self.bias if self.skip_bias_add else None
 
 
 @ReplicatedLinear.register_oot(name="ReplicatedLinear")

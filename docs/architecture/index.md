@@ -671,6 +671,14 @@ backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't 
   `cpu:gloo,spyre:spyreccl` group.
 - **`reduce_scatter`** — raises; it is not on the TP forward path.
 
+Collectives between cards are staged through host memory (HDMA, no card-to-card path), so
+a collective costs the bytes each rank moves. An FP8 `SpyreRowParallelLinear` whose input
+is narrower than twice its output (`o_proj`, not `down_proj`) therefore skips its
+`all_reduce` for a token bucket of at least 256 rows. It all-gathers its `[T, K / tp]` input
+(`2·T·K` bytes per rank instead of the all-reduce's `4·T·N`) and runs the whole GEMM against
+`weight_full`, the full `[K, N]` QFP8WT weight gathered across the TP CPU group at load.
+Decode buckets keep the `all_reduce`: their few rows make the transfer's fixed cost dominate.
+
 `gather` is not overridden — it works natively via `libspyre_comms`. The
 `tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
 signal: when a probe flips green, delete the corresponding override or workaround.

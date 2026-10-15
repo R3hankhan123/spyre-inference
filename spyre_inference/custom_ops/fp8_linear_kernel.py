@@ -156,6 +156,29 @@ def _dma_checkpoint_qfp8wt(weight: torch.Tensor) -> torch.Tensor:
     return qweight
 
 
+def _gather_row_parallel_weight(layer: torch.nn.Module, weight: torch.Tensor) -> None:
+    """Give a row-parallel layer that gathers its input the full ``[K, N]`` weight.
+
+    Each rank holds a ``[K / tp, N]`` slice of K, in rank order, so concatenating the
+    ranks' host shards rebuilds the checkpoint weight. The per-channel or per-tensor
+    scale is over N, which row parallelism does not split, so the local one serves.
+    Runs once per layer at load, on the TP group's CPU group, in the same layer order
+    on every rank.
+    """
+    if not getattr(layer, "gathers_input", False):
+        return
+    from vllm.distributed import get_tp_group
+
+    tp = get_tp_group()
+    shard = weight.detach().cpu().contiguous().view(torch.uint8)
+    shards = [torch.empty_like(shard) for _ in range(tp.world_size)]
+    torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
+        shards, shard, group=tp.cpu_group
+    )
+    full = torch.cat(shards).view(torch.float8_e4m3fn)
+    layer.weight_full = Parameter(_dma_checkpoint_qfp8wt(full), requires_grad=False)
+
+
 def _quantize_fp16_qfp8wt(
     w_fp16: torch.Tensor, weight_scale: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -200,6 +223,7 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
             # weight is DMA'd now, before that .to, so the generic H2D never
             # sees float8 (torch-spyre#4467, #4663).
             if weight.device.type != "spyre":
+                _gather_row_parallel_weight(layer, weight)
                 weight = _dma_checkpoint_qfp8wt(weight)
             else:
                 _require_qfp8wt(weight)
@@ -248,10 +272,23 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
                 "SpyreFp8LinearKernel quantizes activations in the block graph "
                 f"and cannot consume {type(x).__name__}."
             )
+        return self.apply_fp8(
+            x,
+            cast(torch.Tensor, layer.weight),
+            cast(torch.Tensor, layer.weight_scale),
+            bias,
+        )
+
+    def apply_fp8(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``x @ weight`` for a QFP8WT ``weight``; ``apply_weights`` on explicit tensors."""
         orig_shape = x.shape
         x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-        weight = cast(torch.Tensor, layer.weight)
-        weight_scale = cast(torch.Tensor, layer.weight_scale)
         if self._per_token_act:
             scale_a = torch.ops.spyre.quantscalepertokenfp8(
                 x2d,  # ty: ignore[invalid-argument-type]
