@@ -341,11 +341,28 @@ def _moe_persistent_selected_routing(
     return (packed @ route_identity)[..., :1]
 
 
-def _token_cores(tokens: int) -> int:
+def _token_cores(tokens: int, cores: int | None = None) -> int:
     from torch_spyre._inductor import config as spyre_config
 
-    limit = min(tokens, spyre_config.sencores)
+    limit = min(tokens, cores or spyre_config.sencores)
     return max(split for split in range(1, limit + 1) if tokens % split == 0)
+
+
+# A work-division hint leaves the dims it does not name unsplit, so splitting tokens alone
+# runs a small batch on as many cores as it has tokens, each streaming every expert whole.
+# Up to this many tokens the hidden dim is split too, which measured about twice as fast at
+# decode and speculative-verify sizes; larger batches keep the token split.
+_PERSISTENT_HIDDEN_SPLIT = 4
+_PERSISTENT_HIDDEN_SPLIT_MAX_TOKENS = 32
+
+
+def _persistent_work_div(tokens: int, hidden: int, stick: int) -> dict[str, int]:
+    from torch_spyre._inductor import config as spyre_config
+
+    split = _PERSISTENT_HIDDEN_SPLIT
+    if tokens <= _PERSISTENT_HIDDEN_SPLIT_MAX_TOKENS and hidden % (split * stick) == 0:
+        return {"H": split, "T": _token_cores(tokens, spyre_config.sencores // split)}
+    return {"T": _token_cores(tokens)}
 
 
 def _name_persistent_dims(
@@ -379,6 +396,7 @@ def _moe_persistent(
     up: torch.Tensor,
     down: torch.Tensor,
     activation: str,
+    stick: int = 64,
 ) -> torch.Tensor:
     # Process routed experts over token tiles using the persistent weight pools.
     from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -392,7 +410,8 @@ def _moe_persistent(
         activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
         return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
 
-    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
+    work_div = _persistent_work_div(x.shape[0], x.shape[1], stick)
+    with spyre_hint(work_div=work_div):
         result, _ = for_each_tile(
             expert_body,
             (x, route, gate, up, down),
@@ -513,6 +532,7 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
         layer.spyre_moe_up,
         layer.spyre_moe_down,
         layer.spyre_moe_recipe.activation,
+        layer.spyre_moe_stick,
     )
 
 
