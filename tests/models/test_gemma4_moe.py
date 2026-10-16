@@ -1028,6 +1028,25 @@ def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
     assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
 
 
+# gemma-4-26B-A4B's hidden at a verify-step batch and below it; a batch past the hidden
+# split's limit; and a hidden that four whole sticks do not divide.
+@pytest.mark.parametrize(
+    ("tokens", "hidden", "hidden_split"), [(8, 2816, 4), (32, 2816, 4), (64, 2816, 0), (8, 192, 0)]
+)
+def test_persistent_work_div_splits_hidden_for_small_batches(tokens, hidden, hidden_split):
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import _persistent_work_div, _token_cores
+
+    work_div = _persistent_work_div(tokens, hidden, 64)
+    if hidden_split:
+        cores = spyre_config.sencores // hidden_split
+        assert work_div == {"H": hidden_split, "T": _token_cores(tokens, cores)}
+        assert hidden_split * work_div["T"] <= spyre_config.sencores
+    else:
+        assert work_div == {"T": _token_cores(tokens)}
+
+
 def test_persistent_expert_loop_matches_dense_on_host():
     from spyre_inference.moe import _moe_persistent
 
