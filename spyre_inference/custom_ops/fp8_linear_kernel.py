@@ -12,35 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre FP8 linear: QFP8WT weights, ops traced into the block graph.
+"""Spyre FP8 linear: DMA'd ``qfp8wt`` weights, ``spyre.scaled_mm``.
 
-Checkpoint ``float8_e4m3fn`` weights are DMA'd straight into QFP8WT
-(``_dma_to_spyre_fp8_kernel``, torch-spyre#4663). ``model.to("spyre")`` then
-skips that parameter. Every vLLM FP8 method, checkpoint or online, hands this
-kernel a float8 weight, so there is no fp16 path. ``apply_weights`` only reads
-``layer.weight`` and ``layer.weight_scale``:
+Load DMAs checkpoint FP8 straight into ``qfp8wt`` (torch-spyre#4663), so
+``model.to("spyre")`` skips it (CPU ``float8.to("spyre")`` is the wrong layout;
+torch-spyre#4467). ``apply_weights`` traces into the block graph, or compiles as
+its own graph outside one, since ``spyre.scaled_mm`` has no eager kernel:
 
-    scale_a = quantscalepertokenfp8(x)              # per-token
+    scale_a = quantscalepertokenfp8(x)              # in-graph, per-token
     y = scaled_mm(qfp8ch(x), qfp8wt) * (scale_a * scale_b)
 
-Those ops sit in the block graph (``fullgraph=True``). There is no nested
-``torch.compile`` and no Dynamo disable.
+Per-tensor activations use the checkpoint's static ``input_scale``, or else compute
+``scale_a = amax(x) / FP8_E4M3FN_MAX``, because ``quantscalepertokenfp8`` always
+reduces over the hidden dim.
 
-``aten._scaled_mm`` would decompose that product into two full ``[M, N]``
-multiplies plus a bias add. Folding the scales first is one epilogue.
-
-Per-tensor activations use the checkpoint's static ``input_scale`` when it has
-one, and otherwise compute ``scale_a = amax(x) / FP8_E4M3FN_MAX`` in the same
-graph, because ``quantscalepertokenfp8`` always reduces over the hidden dim.
-
-``spyre.scaled_mm`` and ``quantscalepertokenfp8`` lower only inside a compiled
-graph, so ``check_and_update_config`` rejects a quantized model under
-``--enforce-eager``.
-
-The weight must be ``QFP8WT`` (torch-spyre#4490).
-
-SuperDSC M/N tiling is the inductor backend's job. This kernel does not split
-rows or fused QKV/gate_up columns.
+The DMA'd qfp8wt must keep ``QFP8WT`` at the compiled GEMM boundary (torch-spyre
+#4490). There is no in-graph qfp8wt fallback and no env toggle.
 """
 
 from __future__ import annotations
@@ -59,6 +46,8 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
 )
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.platforms import PlatformEnum
+
+from .lazy_compile import CompileOutermost, maybe_compile
 
 logger = init_logger(__name__)
 
@@ -81,12 +70,8 @@ def _fp8_gemm_epilogue(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """``y * (scale_a * weight_scale)``, plus bias when present.
-
-    One pointwise formula, so inductor emits a single epilogue instead of the
-    two scale multiplies and the bias add that ``aten._scaled_mm`` decomposes
-    into.
-    """
+    """``y * (scale_a * weight_scale) + bias``: one epilogue, where ``aten._scaled_mm``
+    decomposes into two full ``[M, N]`` multiplies."""
     scaled = y * (scale_a * weight_scale)
     return scaled if bias is None else scaled + bias
 
@@ -100,14 +85,14 @@ def _require_qfp8wt(weight: torch.Tensor) -> None:
     getter = getattr(weight, "device_tensor_layout", None)
     if getter is None:
         raise RuntimeError(
-            "the QFP8WT DMA produced a weight with no "
+            "the qfp8wt DMA produced a weight with no "
             "device_tensor_layout; QFP8WT must be readable at the compiled "
             "scaled_mm boundary."
         )
     layout = getter()
     if layout is None:
         raise RuntimeError(
-            "the QFP8WT DMA produced a weight whose "
+            "the qfp8wt DMA produced a weight whose "
             "device_tensor_layout is None; QFP8WT must be present at the "
             "compiled scaled_mm boundary."
         )
@@ -121,12 +106,12 @@ def _require_qfp8wt(weight: torch.Tensor) -> None:
         from torch_spyre._C import ElementArrangement
     except ImportError as e:
         raise RuntimeError(
-            "torch_spyre._C.ElementArrangement is required to verify QFP8WT on the cached weight."
+            "torch_spyre._C.ElementArrangement is required to verify QFP8WT on the DMA'd weight."
         ) from e
     if arr != ElementArrangement.QFP8WT:
         raise RuntimeError(
-            "the QFP8WT DMA did not produce QFP8WT "
-            f"(got {arr}); the cached weight must keep that layout at the "
+            "the qfp8wt DMA did not produce QFP8WT "
+            f"(got {arr}); the weight must keep that layout at the "
             "compiled scaled_mm boundary."
         )
 
@@ -145,12 +130,10 @@ def _normalize_weight_scale(weight: torch.Tensor, weight_scale: torch.Tensor) ->
 
 
 def _dma_checkpoint_qfp8wt(weight: torch.Tensor) -> torch.Tensor:
-    """DMA a CPU ``float8_e4m3fn`` weight into QFP8WT.
+    """DMA a CPU ``float8_e4m3fn`` ``[K, N]`` weight into QFP8WT.
 
-    vLLM's ``process_fp8_weight_*`` returns ``weight.t()``, a non-contiguous
-    ``[K, N]``. The QFP8WT DCI addresses the host as contiguous row-major
-    ``k * N + n`` and ignores the tensor's real strides, so compact first or
-    the GEMM reads a scrambled matrix. K must be divisible by 2 and N by 64.
+    vLLM hands over ``weight.t()``, but the QFP8WT DMA assumes row-major host strides
+    whatever the tensor's are, so it must be compacted first.
     """
     from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
@@ -160,7 +143,7 @@ def _dma_checkpoint_qfp8wt(weight: torch.Tensor) -> torch.Tensor:
     return qweight
 
 
-class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
+class SpyreFp8LinearKernel(CompileOutermost, FP8ScaledMMLinearKernel):
     @classmethod
     def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
         return True, None
@@ -173,9 +156,11 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         return False, "requires per-tensor or per-channel weight scales"
 
     def __init__(self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]) -> None:
-        # Skip CUDA QuantFP8 in FP8ScaledMMLinearKernel.__init__.
+        # Skip CUDA QuantFP8 in FP8ScaledMMLinearKernel.__init__, and with it
+        # CompileOutermost.__init__.
         self._per_token_act = c.activation_quant_key.scale.group_shape.is_per_token()
         ScaledMMLinearKernel.__init__(self, c, layer_param_names)
+        self.arm_outer_compile()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = cast(torch.Tensor, layer.weight)
@@ -185,8 +170,7 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
                 f"SpyreFp8LinearKernel expects a float8_e4m3fn weight, got {weight.dtype}."
             )
         scale = _normalize_weight_scale(weight, weight_scale)
-        # DMA'd now, before model.to, so the generic H2D never sees float8
-        # (torch-spyre#4467, #4663); .to then skips the QFP8WT weight.
+        # CPU float8 cannot H2D into qfp8wt. DMA it here, so model.to("spyre") skips it.
         if weight.device.type != "spyre":
             weight = _dma_checkpoint_qfp8wt(weight)
         else:
@@ -200,20 +184,17 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
                 input_scale.detach().max().to(torch.float16).reshape(1), requires_grad=False
             )
 
+    @maybe_compile(force=True)
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Traced into the block graph. Weight and scale are already QFP8WT / fp16
-        # parameters.
-        # input_quant_key() is None, so fusion does not hand us a pre-quantized
-        # activation. The union is only here to match FP8ScaledMMLinearKernel.
+        # input_quant_key() is None, so fusion never hands over a QuantizedActivation.
         if not isinstance(x, torch.Tensor):
             raise TypeError(
-                "SpyreFp8LinearKernel quantizes activations in the block graph "
-                f"and cannot consume {type(x).__name__}."
+                f"SpyreFp8LinearKernel quantizes in-graph and cannot consume {type(x).__name__}."
             )
         orig_shape = x.shape
         x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
@@ -227,17 +208,16 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         elif getattr(layer, "input_scale", None) is not None:
             scale_a = cast(torch.Tensor, layer.input_scale)
         else:
-            # A bfloat16 model cannot use this kernel; `check_and_update_config`
-            # rejects that pairing rather than let float16 output reach a
-            # bfloat16 graph.
             scale_a = _per_tensor_activation_scale(x2d)
         x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
             x2d,  # ty: ignore[invalid-argument-type]
             scale_a,  # ty: ignore[invalid-argument-type]
         )
         y = torch.ops.spyre.scaled_mm(
-            x_fp8,  # ty: ignore[invalid-argument-type]
+            x_fp8,
             weight,  # ty: ignore[invalid-argument-type]
+            # A bfloat16 model cannot use this kernel; `check_and_update_config` rejects
+            # that pairing rather than let float16 output reach a bfloat16 graph.
             out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
         )
         out = _fp8_gemm_epilogue(y, scale_a, weight_scale, bias)
@@ -259,27 +239,11 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         # Required: FP8ScaledMMLinearKernel marks this abstract. Unused on Spyre.
         # Upstream Torch only overrides this hook because parent apply_weights
         # quantizes then calls it with already-FP8 A/B. We replace apply_weights
-        # (QFP8WT weight + in-graph qfp8ch), so this is never entered.
+        # (DMA'd qfp8wt + in-graph qfp8ch), so this is never entered.
         raise RuntimeError(
             "SpyreFp8LinearKernel runs only through apply_weights "
-            "(qfp8ch + qfp8wt). apply_scaled_mm is unused."
+            "(qfp8ch + DMA'd qfp8wt). apply_scaled_mm is unused."
         )
-
-
-def _spyre_fp8_kernel(module: torch.nn.Module) -> SpyreFp8LinearKernel | None:
-    quant_method = getattr(module, "quant_method", None)
-    owners = (
-        quant_method,
-        getattr(module, "scheme", None),
-        getattr(quant_method, "scheme", None),
-    )
-    for owner in owners:
-        if isinstance(owner, SpyreFp8LinearKernel):
-            return owner
-        kernel = getattr(owner, "fp8_linear", None)
-        if isinstance(kernel, SpyreFp8LinearKernel):
-            return kernel
-    return None
 
 
 def register_spyre_fp8_linear_kernel() -> None:

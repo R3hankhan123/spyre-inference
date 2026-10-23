@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Spyre FP8 linear kernel — ``spyre.scaled_mm`` path.
+"""Tests for Spyre FP8 linear kernel — spyre.scaled_mm path.
 
 Spyre ``qfp8ch``/``qfp8wt`` and SuperDSC ``scaled_mm`` are not IEEE
 ``float8_e4m3fn`` / CPU ``_scaled_mm``. These tests check shapes, layouts, and
-that QFP8WT is installed before the forward. Numerical checks compare that
-load-time weight to quantizing fp16 inside a GEMM graph, not a CPU golden.
+the DMA'd weight. Numerical checks compare DMA'd ``qfp8wt`` to the
+in-graph ``qfp8wt`` path  not a CPU golden.
 """
 
 import warnings
@@ -230,12 +230,8 @@ class TestSpyreFp8LinearKernel:
         kernel.process_weights_after_loading(layer)
         return layer
 
-    def _run_spyre_apply(self, kernel, layer, x):
-        """Call apply_weights inside a compile, as the block graph does.
-
-        ``spyre.scaled_mm`` has no eager kernel. Serving traces this method
-        from the block; a bare call returns None.
-        """
+    def _run_spyre_apply(self, kernel, layer, x, *, in_block: bool = True):
+        """Call apply_weights inside a compile, as the block graph does, or bare."""
         from torch_spyre.ops.fallbacks import FallbackWarning
 
         # Stands in for model.to("spyre"), which moves the scales; the QFP8WT weight
@@ -245,15 +241,15 @@ class TestSpyreFp8LinearKernel:
             if scale is not None:
                 moved = torch.nn.Parameter(scale.data.to(x.device), requires_grad=False)
                 setattr(layer, name, moved)
-        compiled = torch.compile(
-            lambda inp: kernel.apply_weights(layer, inp),
-            backend="inductor",
-            fullgraph=True,
-            dynamic=False,
-        )
+
+        def apply(inp):
+            return kernel.apply_weights(layer, inp)
+
+        if in_block:
+            apply = torch.compile(apply, backend="inductor", fullgraph=True, dynamic=False)
         with warnings.catch_warnings():
             warnings.simplefilter("error", FallbackWarning)
-            actual = compiled(x)
+            actual = apply(x)
         assert actual.device.type == "spyre", actual.device
         return actual
 
@@ -267,7 +263,7 @@ class TestSpyreFp8LinearKernel:
 
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
-        """apply_weights runs spyre.scaled_mm plus one scale epilogue on Spyre."""
+        """apply_weights runs spyre.scaled_mm on Spyre."""
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -292,10 +288,10 @@ class TestSpyreFp8LinearKernel:
     @pytest.mark.parametrize(
         "batch, seq_len",
         [
-            (1, 5),
-            (5, 1),
-            (13, 10),
-            (10, 13),
+            (1, 5),  # M=5
+            (5, 1),  # M=5: same total, different reshape
+            (13, 10),  # M=130
+            (10, 13),  # M=130: same total, different reshape
         ],
     )
     def test_scaled_mm_3d_matches_2d(self, batch, seq_len):
@@ -565,6 +561,40 @@ class TestSpyreFp8LinearKernel:
         rel = ((actual - expected).norm() / expected.norm()).item()
         assert rel < 0.05, f"relative error {rel:.4f}"
 
+    def test_eager_apply_compiles_its_own_graph(self):
+        """Under enforce_eager apply_weights compiles as its own graph, matching the
+        in-block result: ``spyre.scaled_mm`` has no eager kernel."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        from vllm.config import CompilationMode, ModelConfig, VllmConfig, set_current_vllm_config
+        from vllm.config.compilation import CompilationConfig
+
+        register_spyre_fp8_linear_kernel()
+        config = VllmConfig(
+            compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+            model_config=ModelConfig(dtype=torch.float16, enforce_eager=True),
+        )
+        with set_current_vllm_config(config):
+            try:
+                kernel = _make_kernel(granite_channel=True)
+            except ImportError:
+                pytest.skip("vLLM FP8 channel QuantKey unavailable")
+        assert not kernel.spyre_compile_enabled
+
+        torch.manual_seed(11)
+        in_features, out_features = 128, 256
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=True)
+        x = torch.randn(5, in_features, dtype=torch.float16, device="spyre")
+
+        eager = self._run_spyre_apply(kernel, layer, x, in_block=False)
+        assert kernel.spyre_compiled_kernel is not None
+        in_block = self._run_spyre_apply(kernel, layer, x)
+        torch.testing.assert_close(eager, in_block, atol=0.0, rtol=0.0)
+
     def test_static_input_scale_is_used(self):
         """A checkpoint's static ``input_scale`` replaces the in-graph amax scale."""
         if not spyre_available():
@@ -632,11 +662,6 @@ def test_require_qfp8wt_fails_without_layout():
         _require_qfp8wt(torch.zeros(2, 2, dtype=torch.float16))
 
 
-def test_apply_weights_is_traced():
-    """The forward is plain code so the block graph can use fullgraph=True."""
-    assert not getattr(SpyreFp8LinearKernel.apply_weights, "_torchdynamo_disable", False)
-
-
 def test_process_weights_folds_static_input_scale(monkeypatch):
     """Per-shard static ``input_scale`` becomes one fp16 ``[1]`` scale: their max."""
     if SpyreFp8LinearKernel is None:
@@ -678,27 +703,3 @@ def test_process_weights_rejects_fp16():
     layer.weight_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=False)
     with pytest.raises(TypeError, match="float8_e4m3fn"):
         kernel.process_weights_after_loading(layer)
-
-
-def test_fp8_linear_outside_compiled_blocks_is_rejected(monkeypatch):
-    """Under per-block compile an FP8 linear outside every block would get None from
-    ``spyre.scaled_mm``; the runner rejects that at startup instead."""
-    from types import SimpleNamespace
-
-    from spyre_inference.v1.worker import spyre_model_runner
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    block, head = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
-    model = torch.nn.ModuleDict({"layers": torch.nn.ModuleList([block]), "head": head})
-    monkeypatch.setattr(spyre_model_runner, "_repeated_block_lists", lambda m: [(m.layers, False)])
-    fp8_modules = {id(block)}
-    monkeypatch.setattr(
-        fp8_linear_kernel, "_spyre_fp8_kernel", lambda m: object() if id(m) in fp8_modules else None
-    )
-    runner = SimpleNamespace(model=model)
-
-    TorchSpyreModelRunner._check_fp8_linears_compiled(runner)  # inside a block: fine
-
-    fp8_modules.add(id(head))
-    with pytest.raises(NotImplementedError, match="head"):
-        TorchSpyreModelRunner._check_fp8_linears_compiled(runner)

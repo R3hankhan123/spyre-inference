@@ -872,7 +872,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Install torch.compile wrappers; tracing happens on the first forward.
 
         `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
-        Every graph is ``fullgraph=True``; FP8 ``apply_weights`` is plain tensor code.
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -906,7 +905,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = self._compile_blocks()
             tower = self._compiled_tower_blocks
             if num_blocks:
-                self._check_fp8_linears_compiled()
                 logger.info(
                     "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre.",
                     num_blocks,
@@ -929,29 +927,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
         logger.info("Wrapped %s as a single graph for Spyre.", model_name)
-
-    def _check_fp8_linears_compiled(self) -> None:
-        """Fail at startup if an FP8 linear sits outside every compiled block.
-
-        ``spyre.scaled_mm`` lowers only inside a graph and returns None eagerly, so such a
-        layer would otherwise break on its first forward.
-        """
-        from spyre_inference.custom_ops.fp8_linear_kernel import _spyre_fp8_kernel
-
-        model = cast(nn.Module, self.model)
-        compiled = {
-            id(m) for blocks, _ in _repeated_block_lists(model) for b in blocks for m in b.modules()
-        }
-        outside = [
-            name
-            for name, m in model.named_modules()
-            if id(m) not in compiled and _spyre_fp8_kernel(m) is not None
-        ]
-        if outside:
-            raise NotImplementedError(
-                f"FP8 linears outside the compiled transformer blocks: {outside}. They "
-                "only run inside a compiled graph; set SPYRE_COMPILE_GRANULARITY=model."
-            )
 
     def _compile_blocks(self) -> int:
         # Only decoder blocks are returned: the count decides the whole-model fallback,

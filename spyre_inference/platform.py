@@ -691,22 +691,13 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel's scales and GEMM output are float16. The
-            # weight itself stays float8 in QFP8WT.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(
                     f"Spyre does not support quantization ({quantization}) with "
                     f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
                     "the run was asked for in bfloat16. Run the unquantized checkpoint."
-                )
-            # spyre.scaled_mm and quantscalepertokenfp8 have no eager kernel, and eager
-            # token counts are unbucketed, so a nested compile would recompile per step.
-            if quantization is not None and vllm_config.model_config.enforce_eager:
-                raise ValueError(
-                    f"Spyre does not support quantization ({quantization}) with "
-                    "--enforce-eager: the FP8 linear ops lower only inside a compiled "
-                    "graph. Drop --enforce-eager."
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
