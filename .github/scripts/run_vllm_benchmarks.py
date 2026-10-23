@@ -58,6 +58,9 @@ DATASET_PATH_DEFAULTS = {
         "/models/online_benchmarking_data_reordered/"
         "all_sequences_2025.11.03_e2ee1b0_correct_order.jsonl"
     ),
+    "SPYRE_VISION_DATASET": (
+        "/models/online_benchmarking_data_reordered/wdu_combined_article_payload_fixed.jsonl"
+    ),
 }
 
 
@@ -199,8 +202,8 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
             log.error("%s needs dataset %s, which is not present on this host", test_name, path)
         log.error(
             "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET / SPYRE_ALL_SEQUENCES_DATASET "
-            "at this host's copies "
-            "of the trace files, or mount them at the paths above."
+            "/ SPYRE_VISION_DATASET at this host's copies of the trace files, or mount "
+            "them at the paths above."
         )
         sys.exit(2)
     return selected
@@ -689,16 +692,17 @@ def main():
 
     # Run serve benchmarks (after latency/throughput to avoid port conflicts)
     if "serve" in bench_types:
-        passed, failed = run_serve_benchmarks_from_file(
-            config_file=config_files["serve"],
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
+        for serve_config in (config_files["serve"], configs_dir / "multimodal-serve-tests.yaml"):
+            passed, failed = run_serve_benchmarks_from_file(
+                config_file=serve_config,
+                results_dir=results_dir,
+                spyre_devices=args.spyre_devices,
+                aiu_world_size=args.aiu_world_size,
+                models=models,
+                tps=tps,
+            )
+            total_passed += passed
+            total_failed += failed
 
     # Summary
     log.info("=== Benchmark Summary ===")
