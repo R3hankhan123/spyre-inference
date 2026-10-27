@@ -111,6 +111,27 @@ def _raise_dynamo_recompile_limits() -> None:
 _raise_dynamo_recompile_limits()
 
 
+def _maybe_uniproc(parallel_config, requested_backend) -> None:
+    """Keep the single worker inside EngineCore (the uni executor) at world_size 1.
+
+    CpuPlatform rewrites the "uni" backend to "mp" so OMP can be set up in a fresh
+    worker process. Spyre already pins the threading env vars in configure_threading()
+    before that rewrite, so at world_size 1 the extra Worker process only costs startup
+    time. ``requested_backend`` is the value before CpuPlatform ran. vLLM picks "uni" at
+    world_size 1 when no backend is given, so an explicit
+    ``--distributed-executor-backend mp`` (or any other backend) is left alone.
+    """
+    if parallel_config.world_size != 1 or requested_backend not in (None, "uni"):
+        return
+    if parallel_config.distributed_executor_backend != "mp":
+        return
+    logger.info(
+        "Using the uni executor at world_size 1; pass --distributed-executor-backend mp "
+        "to run the worker in its own process."
+    )
+    parallel_config.distributed_executor_backend = "uni"
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -136,9 +157,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
-
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
@@ -347,15 +365,16 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
-        The token budget ``R`` is the only input. Both other limits are written back
-        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
-        shape every encoder path runs on.
+        ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
+        one entry when the model fits in the 2048-row body, and one entry per body when
+        ``max_model_len`` is longer — a step pads to the smallest of those.
 
-        The scheduler is left alone -- the ragged path means no batch upstream can form
-        has to be refused.
+        The scheduler token cap stays the largest body, so one max-length sequence can
+        be scheduled. The ragged path still covers a batch no rectangle holds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -368,18 +387,17 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # vLLM's verify_max_model_len runs before this hook, so the floor
-        # `encoder_budget_rows` applies is not checked for us.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
+        # fast body; `encoder_budget_rows` then floors back up to max_model_len when
+        # the model is longer, which is the scheduler cap.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
+        full_budget = encoder_budget_rows(
+            max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+        )
 
         # The shortest length carries the widest rectangle, so no batch ever needs more
         # width than the ladder offers.
-        widest = max(
-            1,
-            encoder_budget_rows(
-                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
-            )
-            // ENCODER_SEQ_ALIGNMENT,
-        )
+        widest = max(1, full_budget // ENCODER_SEQ_ALIGNMENT)
         if prev_num_seqs > widest:
             logger.warning(
                 "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
@@ -390,24 +408,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
-        budget = encoder_shape_tables(vllm_config).budget
-        scheduler_config.max_num_batched_tokens = budget
-
-        # One body shape: every rectangle is exactly `budget` rows and the ragged path
-        # packs into the same buffer, so the attention kernels key on sequence shapes
-        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        # Restore the scheduler cap before the tables are memoised. The worker reads
+        # the same limits, and a table built against the temporary 2048 cap would be a
+        # different cache entry from the one serving uses. That restored cap is the
+        # largest body, so the tables do not change it again.
+        scheduler_config.max_num_batched_tokens = full_budget
+        tables = encoder_shape_tables(vllm_config)
+        # A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
-            vllm_config.compilation_config.compile_sizes = [budget]
+            vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; ragged groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
+            "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
-            budget,
-            budget,
+            tables.budget,
+            list(tables.budgets),
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )
@@ -454,7 +472,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        # Linear layers use SpyreFp8LinearKernel (spyre.scaled_mm).
         return True
 
     @classmethod
@@ -670,8 +688,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel's scales and GEMM output are float16. The
-            # weight itself stays float8 in QFP8WT.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(
@@ -813,8 +830,12 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
+        # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
+        requested_backend = parallel_config.distributed_executor_backend
+
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+        _maybe_uniproc(parallel_config, requested_backend)
 
         # Must run after super(), which sets a block_size default of its own, and before
         # the num_gpu_blocks_override math below, which reads block_size.

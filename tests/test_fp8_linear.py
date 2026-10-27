@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Spyre FP8 linear kernel — ``spyre.scaled_mm`` path.
+"""Tests for Spyre FP8 linear kernel — spyre.scaled_mm path.
 
 Spyre ``qfp8ch``/``qfp8wt`` and SuperDSC ``scaled_mm`` are not IEEE
 ``float8_e4m3fn`` / CPU ``_scaled_mm``. These tests check shapes, layouts, and
-that QFP8WT is installed before the forward. Numerical checks compare that
-load-time weight to quantizing fp16 inside a GEMM graph, not a CPU golden.
+the DMA'd weight. Numerical checks compare DMA'd ``qfp8wt`` to the
+in-graph ``qfp8wt`` path  not a CPU golden.
 """
 
 import warnings
@@ -26,6 +26,7 @@ import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
+from spyre_inference.custom_ops import fp8_linear_kernel
 from spyre_inference.custom_ops.fp8_linear_kernel import (
     FP8_E4M3FN_MAX,
     SpyreFp8LinearKernel,
@@ -214,51 +215,41 @@ class TestSpyreFp8LinearKernel:
         assert getattr(layer, "weight_t", None) is None
 
     def _prepare_spyre_apply_layer(self, kernel, weight_kn, *, per_channel: bool):
-        """Normalize scales, move the fp16 weight onto Spyre, quantize once.
-
-        The weight passed through ``process_weights_after_loading`` is fp16, so
-        this does not take the checkpoint DMA. ``install_qfp8wt`` is the
-        post-``model.to`` step; ``apply_weights`` does not quantize.
-        """
+        """A checkpoint-style layer: ``weight_kn`` quantized to float8 on the host, then
+        DMA'd to QFP8WT by ``process_weights_after_loading``, as serving loads it."""
         if per_channel:
-            _, weight_scale = _quantize_weight_fp8_per_channel(weight_kn)
+            weight_fp8, weight_scale = _quantize_weight_fp8_per_channel(weight_kn)
             weight_scale = weight_scale.reshape(-1, 1)
         else:
-            _, weight_scale = _quantize_weight_fp8(weight_kn)
+            weight_fp8, weight_scale = _quantize_weight_fp8(weight_kn)
             weight_scale = weight_scale.reshape(1)
 
         layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(weight_kn.contiguous(), requires_grad=False)
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
         kernel.process_weights_after_loading(layer)
-        layer.weight = torch.nn.Parameter(weight_kn.contiguous().to("spyre"), requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(
-            layer.weight_scale.data.to("spyre"), requires_grad=False
-        )
-        kernel.install_qfp8wt(layer)
         return layer
 
-    def _run_spyre_apply(self, kernel, layer, x):
-        """Call apply_weights inside a compile, as the block graph does.
-
-        ``spyre.scaled_mm`` has no eager kernel. Serving traces this method
-        from the block; a bare call returns None.
-        """
+    def _run_spyre_apply(self, kernel, layer, x, *, in_block: bool = True):
+        """Call apply_weights inside a compile, as the block graph does, or bare."""
         from torch_spyre.ops.fallbacks import FallbackWarning
 
-        # Checkpoint tests stop after process_weights, which leaves the scale
-        # on CPU. install_qfp8wt is the post-model.to step: move that scale,
-        # and quantize when the weight is still fp16.
-        kernel.install_qfp8wt(layer)
-        compiled = torch.compile(
-            lambda inp: kernel.apply_weights(layer, inp),
-            backend="inductor",
-            fullgraph=True,
-            dynamic=False,
-        )
+        # Stands in for model.to("spyre"), which moves the scales; the QFP8WT weight
+        # is already there.
+        for name in ("weight_scale", "input_scale"):
+            scale = getattr(layer, name, None)
+            if scale is not None:
+                moved = torch.nn.Parameter(scale.data.to(x.device), requires_grad=False)
+                setattr(layer, name, moved)
+
+        def apply(inp):
+            return kernel.apply_weights(layer, inp)
+
+        if in_block:
+            apply = torch.compile(apply, backend="inductor", fullgraph=True, dynamic=False)
         with warnings.catch_warnings():
             warnings.simplefilter("error", FallbackWarning)
-            actual = compiled(x)
+            actual = apply(x)
         assert actual.device.type == "spyre", actual.device
         return actual
 
@@ -272,7 +263,7 @@ class TestSpyreFp8LinearKernel:
 
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
-        """apply_weights runs spyre.scaled_mm plus one scale epilogue on Spyre."""
+        """apply_weights runs spyre.scaled_mm on Spyre."""
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -297,10 +288,10 @@ class TestSpyreFp8LinearKernel:
     @pytest.mark.parametrize(
         "batch, seq_len",
         [
-            (1, 5),
-            (5, 1),
-            (13, 10),
-            (10, 13),
+            (1, 5),  # M=5
+            (5, 1),  # M=5: same total, different reshape
+            (13, 10),  # M=130
+            (10, 13),  # M=130: same total, different reshape
         ],
     )
     def test_scaled_mm_3d_matches_2d(self, batch, seq_len):
@@ -381,8 +372,8 @@ class TestSpyreFp8LinearKernel:
         assert isinstance(layer.quant_method.fp8_linear, SpyreFp8LinearKernel)
 
     @pytest.mark.parametrize("per_channel", [False, True])
-    def test_qfp8wt_installed_once_and_reused(self, per_channel):
-        """install_qfp8wt quantizes once; later applies read that same weight."""
+    def test_qfp8wt_loaded_once_and_reused(self, per_channel):
+        """Applies read the weight process_weights DMA'd, with no requantize."""
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -403,7 +394,6 @@ class TestSpyreFp8LinearKernel:
         assert weight.device.type == "spyre"
         assert weight.shape == (in_features, out_features)
         self._assert_qfp8wt(weight)
-        assert getattr(layer, "_qfp8wt_for_mm", None) is None
 
         x = torch.randn(4, in_features, dtype=torch.float16, device="spyre")
         actual = self._run_spyre_apply(kernel, layer, x)
@@ -536,6 +526,110 @@ class TestSpyreFp8LinearKernel:
             kernel, layer, x, weight_fp16, num_tokens=num_tokens
         )
 
+    # Granite fused QKV (N=6144), o_proj (N=4096) and gate_up (N=25600) at K=4096, with
+    # row counts off the 1/4/128 lattice: the shapes inductor now tiles on its own.
+    @pytest.mark.parametrize(
+        "num_tokens, out_features", [(7, 6144), (1, 4096), (130, 25600)], ids=str
+    )
+    def test_wide_granite_shapes_match_cpu_dequant(self, num_tokens, out_features):
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=True)
+        except ImportError:
+            pytest.skip("vLLM FP8 channel QuantKey unavailable")
+
+        torch.manual_seed(5)
+        in_features = 4096
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        weight_fp8, weight_scale = _quantize_weight_fp8_per_channel(weight_kn)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            weight_scale.reshape(out_features, 1), requires_grad=False
+        )
+        kernel.process_weights_after_loading(layer)
+
+        x = torch.randn(num_tokens, in_features, dtype=torch.float16)
+        actual = self._run_spyre_apply(kernel, layer, x.to("spyre")).cpu().float()
+        expected = x.float() @ (weight_fp8.float() * weight_scale.float())
+        # Activation quantization alone is ~2-3% relative; a wrong tile is far worse.
+        rel = ((actual - expected).norm() / expected.norm()).item()
+        assert rel < 0.05, f"relative error {rel:.4f}"
+
+    def test_eager_apply_compiles_its_own_graph(self):
+        """Under enforce_eager apply_weights compiles as its own graph, matching the
+        in-block result: ``spyre.scaled_mm`` has no eager kernel."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        from vllm.config import CompilationMode, ModelConfig, VllmConfig, set_current_vllm_config
+        from vllm.config.compilation import CompilationConfig
+
+        register_spyre_fp8_linear_kernel()
+        config = VllmConfig(
+            compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+            model_config=ModelConfig(dtype=torch.float16, enforce_eager=True),
+        )
+        with set_current_vllm_config(config):
+            try:
+                kernel = _make_kernel(granite_channel=True)
+            except ImportError:
+                pytest.skip("vLLM FP8 channel QuantKey unavailable")
+        assert not kernel.spyre_compile_enabled
+
+        torch.manual_seed(11)
+        in_features, out_features = 128, 256
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=True)
+        x = torch.randn(5, in_features, dtype=torch.float16, device="spyre")
+
+        eager = self._run_spyre_apply(kernel, layer, x, in_block=False)
+        assert kernel.spyre_compiled_kernel is not None
+        in_block = self._run_spyre_apply(kernel, layer, x)
+        torch.testing.assert_close(eager, in_block, atol=0.0, rtol=0.0)
+
+    def test_static_input_scale_is_used(self):
+        """A checkpoint's static ``input_scale`` replaces the in-graph amax scale."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(3)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        weight_fp16 = weight_kn.contiguous().to("spyre")
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=False)
+        # Deliberately unlike amax(x) / 448, so ignoring it shows in the output.
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor([0.05], dtype=torch.float16, device="spyre"), requires_grad=False
+        )
+        x = torch.randn(4, in_features, dtype=torch.float16, device="spyre")
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        actual = self._run_spyre_apply(kernel, layer, x).cpu()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            expected = _in_graph_qfp8wt_mm_static(
+                x, layer.input_scale, weight_fp16, layer.weight_scale
+            ).cpu()
+        max_diff = (actual.float() - expected.float()).abs().max().item()
+        assert max_diff < 0.1, f"static input_scale max_diff={max_diff:.6f}"
+
     def _assert_installed_matches_in_graph(
         self, kernel, layer, x, weight_fp16, *, num_tokens: int
     ) -> None:
@@ -568,13 +662,31 @@ def test_require_qfp8wt_fails_without_layout():
         _require_qfp8wt(torch.zeros(2, 2, dtype=torch.float16))
 
 
-def test_apply_weights_is_traced():
-    """The forward is plain code so the block graph can use fullgraph=True."""
-    assert not getattr(SpyreFp8LinearKernel.apply_weights, "_torchdynamo_disable", False)
+def test_process_weights_folds_static_input_scale(monkeypatch):
+    """Per-shard static ``input_scale`` becomes one fp16 ``[1]`` scale: their max."""
+    if SpyreFp8LinearKernel is None:
+        pytest.skip("vLLM FP8 kernel base unavailable")
+
+    register_spyre_fp8_linear_kernel()
+    try:
+        kernel = _make_kernel()
+    except ImportError:
+        pytest.skip("vLLM FP8 APIs unavailable")
+
+    # The DMA needs a card; the scale handling under test does not.
+    monkeypatch.setattr(fp8_linear_kernel, "_dma_checkpoint_qfp8wt", lambda w: w)
+    layer = torch.nn.Module()
+    weight = torch.randn(64, 128, dtype=torch.float16).to(torch.float8_e4m3fn)
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=False)
+    layer.input_scale = torch.nn.Parameter(torch.tensor([0.5, 2.0, 1.0]), requires_grad=False)
+    kernel.process_weights_after_loading(layer)
+    assert layer.input_scale.dtype == torch.float16
+    assert layer.input_scale.tolist() == [2.0]
 
 
-def test_install_qfp8wt_rejects_cpu_fp16():
-    """fp16 quantization happens after the Spyre move, not on a CPU weight."""
+def test_process_weights_rejects_fp16():
+    """Every vLLM FP8 method quantizes before this kernel; an fp16 weight is a bug."""
     if SpyreFp8LinearKernel is None:
         pytest.skip("vLLM FP8 kernel base unavailable")
 
@@ -589,37 +701,5 @@ def test_install_qfp8wt_rejects_cpu_fp16():
         torch.randn(64, 128, dtype=torch.float16), requires_grad=False
     )
     layer.weight_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=False)
-    kernel.process_weights_after_loading(layer)
-    with pytest.raises(RuntimeError, match="on Spyre"):
-        kernel.install_qfp8wt(layer)
-
-
-def test_row_parallel_weight_gathered_in_rank_order(monkeypatch):
-    """A layer that gathers its input gets every rank's K slice, concatenated in order."""
-    from types import SimpleNamespace
-
-    import vllm.distributed
-
-    from spyre_inference.custom_ops import fp8_linear_kernel
-
-    shards = [torch.full((2, 64), r + 1.0).to(torch.float8_e4m3fn) for r in range(4)]
-
-    def all_gather(out, shard, group=None):
-        assert group == "cpu"
-        for o, s in zip(out, shards):
-            o.copy_(s.view(torch.uint8))
-
-    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
-    monkeypatch.setattr(
-        vllm.distributed, "get_tp_group", lambda: SimpleNamespace(world_size=4, cpu_group="cpu")
-    )
-    monkeypatch.setattr(fp8_linear_kernel, "_dma_checkpoint_qfp8wt", lambda w: w)
-
-    layer = torch.nn.Module()
-    layer.gathers_input = True
-    fp8_linear_kernel._gather_row_parallel_weight(layer, shards[0])
-    assert torch.equal(layer.weight_full.view(torch.uint8), torch.cat(shards).view(torch.uint8))
-
-    other = torch.nn.Module()
-    fp8_linear_kernel._gather_row_parallel_weight(other, shards[0])
-    assert not hasattr(other, "weight_full")
+    with pytest.raises(TypeError, match="float8_e4m3fn"):
+        kernel.process_weights_after_loading(layer)

@@ -15,9 +15,10 @@
 """Gemma 4 vision-tower workarounds for Spyre.
 
 vLLM loads the tower with plain ``AutoModel.from_config``, so it is stock
-transformers code outside vLLM's layer registries. Every fix is a guarded, idempotent
-monkeypatch and ``apply()`` is the only entry point. The tensor math follows
-hf-adapters#495.
+transformers code outside vLLM's layer registries. The tensor math follows hf-adapters#495.
+``models/gemma4_mm.py`` adapts ``Gemma4ForConditionalGeneration`` with the helpers and
+layers here; ``apply()`` patches the tower only for architectures with no Spyre subclass
+that build it too (``DiffusionGemma``, ``EmbeddingGemma2``).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.models.gemma4 import modeling_gemma4
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
@@ -212,14 +214,10 @@ def _padded_rms_norm(
     return hidden_states
 
 
-def _gemma4_rope_cos_sin(
-    inv_freq: torch.Tensor,
-    position_ids: torch.Tensor,
-    padded_head_dim: int,
-    dtype: torch.dtype,
-    attention_scaling: float = 1.0,
+def gemma4_rope_tables(
+    inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tables for `rope_rotate_matmul`.
+    """`[2, size, D]` cos and signed-sin per axis; patch (x, y) sums rows [0, x], [1, y].
 
     Gemma 4 vision rotates its two position axes independently, each with its own
     `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the padded
@@ -230,23 +228,40 @@ def _gemma4_rope_cos_sin(
     `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
     the padded ones stay an exact identity rotation.
     """
-    positions = position_ids.to("cpu").clamp(min=0).float()
-    angles = positions[..., None] * inv_freq.to("cpu").float()  # [bsz, seq, 2, quarter]
+    quarter = inv_freq.shape[0]
+    half = padded_head_dim // 2
+    angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
     cos_axis = angles.cos() * attention_scaling
     sin_axis = angles.sin() * attention_scaling
-    bsz, seq_len, _, quarter = cos_axis.shape
-    half = padded_head_dim // 2
-    cos_half = torch.ones(bsz, seq_len, half)
-    sin_half_neg = torch.zeros(bsz, seq_len, half)
-    sin_half_pos = torch.zeros(bsz, seq_len, half)
+    cos = torch.zeros(2, size, padded_head_dim)
+    sin = torch.zeros(2, size, padded_head_dim)
     for axis in range(2):
-        start, end = axis * quarter, axis * quarter + quarter
-        cos_half[..., start:end] = cos_axis[:, :, axis, :]
-        sin_half_neg[..., start:end] = -sin_axis[:, :, axis, :]
-        sin_half_pos[..., start:end] = sin_axis[:, :, axis, :]
-    cos_full = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(2)  # [bsz, seq, 1, D]
-    sin_full = torch.cat([sin_half_neg, sin_half_pos], dim=-1).unsqueeze(2)
-    return cos_full.to(dtype), sin_full.to(dtype)
+        lanes = slice(axis * quarter, (axis + 1) * quarter)
+        upper = slice(half + axis * quarter, half + (axis + 1) * quarter)
+        cos[axis, :, lanes] = cos_axis
+        cos[axis, :, upper] = cos_axis
+        sin[axis, :, lanes] = -sin_axis
+        sin[axis, :, upper] = sin_axis
+    cos[0, :, 2 * quarter : half] = 1.0
+    cos[0, :, half + 2 * quarter :] = 1.0
+    return cos, sin
+
+
+def _gemma4_rope_cos_sin(
+    inv_freq: torch.Tensor,
+    position_ids: torch.Tensor,
+    padded_head_dim: int,
+    dtype: torch.dtype,
+    attention_scaling: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin per patch, from `gemma4_rope_tables`."""
+    positions = position_ids.to("cpu").clamp(min=0).long()
+    size = int(positions.max()) + 1
+    cos, sin = gemma4_rope_tables(inv_freq.to("cpu"), size, padded_head_dim, attention_scaling)
+    x, y = positions[..., 0], positions[..., 1]
+    cos_rows = (cos[0, x] + cos[1, y]).unsqueeze(2)
+    sin_rows = (sin[0, x] + sin[1, y]).unsqueeze(2)
+    return cos_rows.to(dtype), sin_rows.to(dtype)
 
 
 def _fp32_inv_freq(rotary_emb, config) -> tuple[torch.Tensor, float]:
@@ -344,11 +359,13 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     )
     # A buffer: an index write inside a compiled block has no device layout. Projection
     # dtype, not the norm's: transformers builds RMSNorm weights fp32, which would promote.
-    attn.register_buffer(
-        "spyre_rope_swap",
-        rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
-        persistent=False,
-    )
+    # Only for a `__class__`-swapped instance (`apply()`), which skipped the constructor's.
+    if "spyre_rope_swap" not in attn._buffers:
+        attn.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
+            persistent=False,
+        )
     attn._spyre_padded_head_dim = padded_head_dim
 
 
@@ -358,18 +375,21 @@ _NOT_PADDED = (
 )
 
 
-def patch_vision_attention() -> None:
-    """Replace `Gemma4VisionAttention.forward` with padded rope + `padded_sdpa`."""
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        return
+class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
+    """Padded rope + `padded_sdpa` over the head dim `pad_vision_weights` padded to."""
 
-    cls = getattr(modeling_gemma4, "Gemma4VisionAttention", None)
-    if cls is None or getattr(cls.forward, "_spyre_patched", False):
-        return
+    spyre_rope_swap: torch.Tensor
 
-    def _forward(
+    def __init__(self, config, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        weight = self.q_proj.linear.weight
+        self.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", _padded_head_dim(self.head_dim), weight.device, weight.dtype),
+            persistent=False,
+        )
+
+    def forward(  # ty: ignore[invalid-method-override]
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -383,7 +403,6 @@ def patch_vision_attention() -> None:
         num_heads = self.config.num_attention_heads
         orig_head_dim = self.head_dim
         padded_head_dim = _padded_head_dim(orig_head_dim)
-        # The class patch reaches every instance; only `pad_vision_weights` adds these.
         if getattr(self, "_spyre_padded_head_dim", None) != padded_head_dim:
             raise RuntimeError(_NOT_PADDED)
 
@@ -401,9 +420,33 @@ def patch_vision_attention() -> None:
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out), None
 
-    _forward._spyre_patched = True
-    cls.forward = _forward
-    logger.info_once("Spyre: patched Gemma4VisionAttention to padded rope + padded SDPA.")
+
+class SpyreGemma4RMSNorm(modeling_gemma4.Gemma4RMSNorm):
+    """``Gemma4RMSNorm`` without fp32 promotion, and with ``rsqrt`` instead of
+    ``pow(x, -0.5)``, which has no lowering here. (Unlike ``SpyreGemmaRMSNorm``, which keeps
+    upstream's fp32 path by compiling it; see ``_padded_rms_norm`` for why this tower cannot.)
+
+    ``forward`` is the override point, not ``_norm``: stock casts to fp32 in both, and both
+    casts have to go.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        weight = self.weight if self.with_scale else None
+        return _padded_rms_norm(hidden_states, weight, self.eps, orig_head_dim=None)
+
+
+_LAYER_NORMS = (
+    "input_layernorm",
+    "post_attention_layernorm",
+    "pre_feedforward_layernorm",
+    "post_feedforward_layernorm",
+)
+
+
+def _swap_class(root: nn.Module, stock: type[nn.Module], spyre: type[nn.Module]) -> None:
+    for module in root.modules():
+        if type(module) is stock:
+            module.__class__ = spyre
 
 
 def patch_vision_encoder() -> None:
@@ -412,14 +455,9 @@ def patch_vision_encoder() -> None:
     Three things in the stock forward do not lower: the mask built by
     `create_bidirectional_mask`, rope over a head_dim that is not stick-aligned, and
     attention over a patch count coprime with the stick. The last two are handled per
-    layer by `patch_vision_attention`; this builds the mask and the rope tables on the
+    layer by `SpyreGemma4VisionAttention`; this builds the mask and the rope tables on the
     host, once per call rather than once per layer.
     """
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        return
-
     cls = getattr(modeling_gemma4, "Gemma4VisionEncoder", None)
     if cls is None or getattr(cls.forward, "_spyre_patched", False):
         return
@@ -441,6 +479,10 @@ def patch_vision_encoder() -> None:
         if pixel_position_ids is None:
             # Optional only to match the stock signature; every caller supplies it.
             raise NotImplementedError("Gemma 4 vision requires pixel_position_ids on Spyre.")
+        layers = self.layers[: config.num_hidden_layers]
+        # The class patch reaches every encoder; only `apply()` swaps in the padded attention.
+        if not all(isinstance(layer.self_attn, SpyreGemma4VisionAttention) for layer in layers):
+            raise RuntimeError(_NOT_PADDED)
         padded_head_dim = _padded_head_dim(config.head_dim)
 
         device = inputs_embeds.device
@@ -467,7 +509,7 @@ def patch_vision_encoder() -> None:
         )
 
         hidden_states = inputs_embeds
-        for layer in self.layers[: config.num_hidden_layers]:
+        for layer in layers:
             hidden_states = layer(
                 hidden_states, position_embeddings=(cos, sin), attention_mask=attn_mask
             )
@@ -481,35 +523,6 @@ def patch_vision_encoder() -> None:
     _forward._spyre_patched = True
     cls.forward = _forward
     logger.info_once("Spyre: patched Gemma4VisionEncoder to head_dim-padded rope + padded SDPA.")
-
-
-def patch_rms_norm() -> None:
-    """Run ``Gemma4RMSNorm`` without fp32 promotion, and with ``rsqrt`` instead of
-    ``pow(x, -0.5)``, which has no lowering here. (Unlike ``SpyreGemmaRMSNorm``, which keeps
-    upstream's fp32 path by compiling it; see ``_padded_rms_norm`` for why this tower cannot.)
-
-    ``forward`` is the patch point, not ``_norm``: stock casts to fp32 in both, and both
-    casts have to go.
-    """
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        return
-
-    cls = getattr(modeling_gemma4, "Gemma4RMSNorm", None)
-    if cls is None or getattr(cls.forward, "_spyre_patched", False):
-        return
-
-    def forward(self, hidden_states):
-        weight = self.weight if self.with_scale else None
-        return _padded_rms_norm(hidden_states, weight, self.eps, orig_head_dim=None)
-
-    forward._spyre_patched = True
-    cls.forward = forward
-    logger.info_once(
-        "Spyre: Gemma4RMSNorm runs without fp32 promotion and uses torch.rsqrt "
-        "instead of torch.pow(x, -0.5); expect small numerical differences."
-    )
 
 
 def _pool_weights(
@@ -555,11 +568,6 @@ def patch_pooler() -> None:
     rows come back to the host because the tail after this is host-side anyway
     (`place_vision_tail_on_cpu`).
     """
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        return
-
     cls = getattr(modeling_gemma4, "Gemma4VisionPooler", None)
     if cls is None or getattr(cls.forward, "_spyre_patched", False):
         return
@@ -614,11 +622,6 @@ def patch_patch_embedder() -> None:
     on the host (``embed_multimodal`` only moves float inputs) while the table lives on
     Spyre.
     """
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        return
-
     cls = getattr(modeling_gemma4, "Gemma4VisionPatchEmbedder", None)
     if cls is None or getattr(cls._position_embeddings, "_spyre_patched", False):
         return
@@ -686,21 +689,26 @@ def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Gemma 4 vision-tower workaround."""
     del device
-    patch_rms_norm()
     patch_patch_embedder()
     patch_pooler()
-    patch_vision_attention()
     patch_vision_encoder()
     encoder = getattr(getattr(model, "vision_tower", None), "encoder", None)
     if encoder is not None:
+        _swap_class(encoder, modeling_gemma4.Gemma4RMSNorm, SpyreGemma4RMSNorm)
+        _swap_class(encoder, modeling_gemma4.Gemma4VisionAttention, SpyreGemma4VisionAttention)
         # Padded projections no longer fit the stock attention's `view(..., head_dim)`,
-        # so a tower whose classes the patches did not reach cannot run at all.
-        layer_classes = (type(encoder), type(encoder.layers[0].self_attn))
-        if not all(getattr(cls.forward, "_spyre_patched", False) for cls in layer_classes):
+        # and the stock norm's fp32 path does not lower, so a tower the patches did not
+        # reach cannot run at all.
+        swapped = all(
+            isinstance(layer.self_attn, SpyreGemma4VisionAttention)
+            and all(isinstance(getattr(layer, n, None), SpyreGemma4RMSNorm) for n in _LAYER_NORMS)
+            for layer in encoder.layers
+        )
+        if not getattr(type(encoder).forward, "_spyre_patched", False) or not swapped:
             raise RuntimeError(
                 "Gemma 4 vision patches did not install: transformers no longer exposes "
-                "Gemma4VisionAttention/Gemma4VisionEncoder as expected, and the padded "
-                "tower cannot run on Spyre unpatched."
+                "Gemma4RMSNorm/Gemma4VisionAttention/Gemma4VisionEncoder as expected, and "
+                "the padded tower cannot run on Spyre unpatched."
             )
         pad_vision_weights(encoder)
         mark_blocks_compilable(encoder.layers)

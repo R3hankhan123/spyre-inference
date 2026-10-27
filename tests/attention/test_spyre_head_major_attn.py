@@ -384,6 +384,25 @@ def test_fp8_kv_cache_is_head_major_only(default_vllm_config):
         )
 
 
+def test_encoder_layers_ignore_an_fp8_cache_dtype(default_vllm_config):
+    """Upstream hands encoder layers the engine's cache dtype, but they keep no cache."""
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        SpyreEncoderAttentionImpl,
+    )
+
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=8,
+        head_size=64,
+        scale=1.0,
+        num_kv_heads=2,
+        kv_cache_dtype="fp8",
+        attn_type=AttentionType.ENCODER_ONLY,
+    )
+    assert not impl.kv_cache_fp8
+
+
 def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
     impl = SpyreHeadMajorAttentionImpl(
         num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
@@ -418,6 +437,131 @@ def _fp8_pages(num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale)
         (k8.float() * k_scale).to(DTYPE),
         (v8.float() * v_scale).to(DTYPE),
     )
+
+
+def _fp8_layer(k_scale, v_scale, **attrs):
+    """An fp8-cache attention layer whose upstream-resolved scales are (k_scale, v_scale)."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    layer = Mock(spec=Attention)
+    layer.impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    layer._k_scale_float, layer._v_scale_float = k_scale, v_scale
+    for name, value in attrs.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def _runner_over(monkeypatch, layers, static_forward_context=None):
+    """A runner whose model is just ``layers``."""
+    from types import SimpleNamespace
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    runner = object.__new__(TorchSpyreModelRunner)
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=layers)))
+    runner.compilation_config = SimpleNamespace(static_forward_context=static_forward_context or {})
+    return runner
+
+
+def _warnings(monkeypatch):
+    from spyre_inference.v1.worker import spyre_model_runner
+
+    warnings = []
+    monkeypatch.setattr(
+        spyre_model_runner.logger, "warning_once", lambda msg, *args: warnings.append(msg)
+    )
+    return warnings
+
+
+def test_distinct_kv_scales_warn_about_warmup(default_vllm_config, monkeypatch):
+    """Each distinct (k_scale, v_scale) pair is its own compile, so startup says so."""
+    first, other = _fp8_layer(0.25, 0.5), _fp8_layer(0.25, 0.5)
+    runner = _runner_over(monkeypatch, [first, other])
+    warnings = _warnings(monkeypatch)
+
+    runner._resolve_kv_scales()
+    assert warnings == [], "one shared pair compiles once"
+    other._k_scale_float = 0.125
+    runner._resolve_kv_scales()
+    assert len(warnings) == 1 and "distinct" in warnings[0]
+
+
+def test_per_head_kv_scales_warn(default_vllm_config, monkeypatch):
+    """Upstream reduces a per-head scheme to its max scale; the cache cannot do better."""
+    layer = _fp8_layer(0.25, 0.5, _k_scale=torch.tensor([0.25, 0.025]))
+    warnings = _warnings(monkeypatch)
+
+    _runner_over(monkeypatch, [layer])._resolve_kv_scales()
+
+    assert layer.impl._kernel_kv_scales() == (0.25, 0.5)
+    assert len(warnings) == 1 and "per-head" in warnings[0]
+
+
+def test_kv_sharing_layer_reads_with_its_target_scales(default_vllm_config, monkeypatch):
+    """A layer reading another's cache dequantizes with the scales that cache was written at."""
+    target = _fp8_layer(0.05, 0.02)
+    # A sharing layer stores nothing, so a calibrated checkpoint leaves its own at 1.0.
+    reader = _fp8_layer(1.0, 1.0, kv_sharing_target_layer_name="layers.0.attn")
+    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
+
+    runner._resolve_kv_scales()
+
+    assert reader.impl._kernel_kv_scales() == (0.05, 0.02)
+
+
+def test_kv_sharing_layer_and_target_must_agree_on_fp8(default_vllm_config, monkeypatch):
+    """A reader whose target skipped fp8 through kv_cache_dtype_skip_layers would decode
+    fp16 pages as fp8, so it fails at load and names the setting."""
+    target = _fp8_layer(1.0, 1.0)
+    target.impl.kv_cache_fp8 = False
+    reader = _fp8_layer(
+        1.0, 1.0, layer_name="layers.1.attn", kv_sharing_target_layer_name="layers.0.attn"
+    )
+    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
+
+    with pytest.raises(ValueError, match="kv_cache_dtype_skip_layers"):
+        runner._resolve_kv_scales()
+
+
+def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch):
+    """A reload passes its arguments through, re-reads the scales, and re-warms only on a
+    change, so an armed compile guard never sees the new scales mid-request."""
+    import contextlib
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from spyre_inference.v1.worker import compile_guard
+
+    layer = _fp8_layer(0.25, 0.5)
+    runner = _runner_over(monkeypatch, [layer])
+    runner._resolve_kv_scales()
+    calls, warmups, allowed = [], [], []
+    new_k_scale = 0.25
+
+    @contextlib.contextmanager
+    def allow_compile(reason):
+        allowed.append(True)
+        yield
+        allowed.pop()
+
+    def reprocess(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        layer._k_scale_float = new_k_scale
+
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", reprocess)
+    monkeypatch.setattr(compile_guard, "allow_compile", allow_compile)
+    monkeypatch.setattr(runner, "warming_up_model", lambda: warmups.append(bool(allowed)))
+
+    runner.reload_weights(weights_path="/ckpt", is_checkpoint_format=False)
+    assert calls == [((), {"weights_path": "/ckpt", "is_checkpoint_format": False})]
+    assert warmups == [], "unchanged scales leave every graph valid"
+
+    new_k_scale = 0.125
+    runner.reload_weights()
+    assert layer.impl._kernel_kv_scales() == (0.125, 0.5)
+    assert warmups == [True], "a change re-warms once, with the compile guard suspended"
 
 
 def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
@@ -1449,49 +1593,6 @@ def test_head_major_batched_decode_correctness(
         soft_cap=soft_cap,
     )
     assert batched_decode_calls, "the batch fell back to the per-seq loop"
-
-
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        # The long context sits mid-batch, so each group's rows are not contiguous.
-        pytest.param([(1, 128)] * 3 + [(1, 2048)] + [(1, 128)] * 4, id="decodes(7+1)"),
-        pytest.param(
-            [(1, 128)] * 3 + [(1, 2048)] + [(1, 128)] * 3 + [(64, 256)], id="decodes(6+1)+prefill"
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_head_major_batched_decode_split_groups(
-    default_vllm_config,
-    monkeypatch,
-    batched_decode_calls,
-    seq_lens,
-    configure_compilation,
-    configure_device,
-):
-    """A long context gets its own batched call, and each call stores to its own rows."""
-    from spyre_inference.v1.attention import spyre_attn_bucketer
-
-    # The test config's 2048-token limit is too short for a split to pay for a real call.
-    monkeypatch.setattr(spyre_attn_bucketer, "DECODE_GROUP_OVERHEAD_ENTRIES", 0)
-    _run_head_major_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-    )
-    assert len(batched_decode_calls) == 2, (
-        f"expected one batched call per group, got {len(batched_decode_calls)}"
-    )
 
 
 @pytest.mark.parametrize(

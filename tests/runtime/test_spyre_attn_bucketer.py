@@ -26,7 +26,6 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _parse_buckets,
     _powers_of_two_up_to,
     batched_decode_chunking,
-    split_decode_groups,
 )
 
 BLOCK_SIZE = 64
@@ -61,8 +60,8 @@ def make_config(
             layer.kv = n
             layers.append(layer)
         arch.__getitem__.side_effect = layers.__getitem__
-        config.model_config.get_num_kv_heads.side_effect = lambda _pc, arch_config=None: (
-            num_kv_heads if arch_config is None else arch_config.kv
+        config.model_config.get_num_kv_heads.side_effect = (
+            lambda _pc, arch_config=None: num_kv_heads if arch_config is None else arch_config.kv
         )
     return config
 
@@ -556,26 +555,3 @@ class TestSingleKvHeadBlockFloorTokenMajor:
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
         assert min(b.num_blocks_buckets) == 1
-
-
-class TestSplitDecodeGroups:
-    """Blocks per decode sequence -> the sequence groups that each get a batched call."""
-
-    @pytest.fixture()
-    def bucketer(self):
-        # The Granite benchmark shape: 128-token blocks up to 256, up to 32 sequences.
-        return SpyreAttnBucketer(make_config(max_model_len=32768, block_size=128, max_num_seqs=32))
-
-    def test_uniform_contexts_stay_one_call(self, bucketer):
-        assert split_decode_groups([24, 25, 26, 30], bucketer) == [[0, 1, 2, 3]]
-
-    def test_one_long_context_gets_its_own_call(self, bucketer):
-        # Eight sequences padded to 256 blocks, against eight at 32 plus one at 256.
-        blocks = [20, 172, 22, 24, 24, 25, 26, 28]
-        assert split_decode_groups(blocks, bucketer) == [[0, 2, 3, 4, 5, 6, 7], [1]]
-
-    def test_a_small_saving_does_not_pay_for_a_call(self, bucketer):
-        assert split_decode_groups([20, 20, 20, 40], bucketer) == [[0, 1, 2, 3]]
-
-    def test_a_single_decode_is_one_call(self, bucketer):
-        assert split_decode_groups([172], bucketer) == [[0]]

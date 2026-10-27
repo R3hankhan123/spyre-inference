@@ -100,7 +100,6 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
-    out_row_ids=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -117,10 +116,6 @@ def batched_decode_head_major_kernel(
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``.
-
-    With ``out_row_ids`` ([num_seqs] int32) sequence s is stored at ``out[out_row_ids[s]]``
-    rather than ``out[s]``, so a batch's decodes can be split across several calls. Padding
-    sequences repeat a real one, so a repeated row id stores the same values twice.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -240,9 +235,6 @@ def batched_decode_head_major_kernel(
     if v_scale is not None and v_scale != 1.0:
         attn = attn * v_scale
     if out is not None:
-        if out_row_ids is not None:
-            out.index_copy_(0, out_row_ids, attn)
-            return out
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
         out[:num_seqs].copy_(attn)

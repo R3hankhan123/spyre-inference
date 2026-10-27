@@ -167,17 +167,39 @@ extra lever there, and the same keep-it-short advice applies.
 
 ## FP8 KV cache
 
-Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving its memory:
+Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
+each cached token takes:
 
 ```bash
 vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
 It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. Attention still computes in the model dtype: pages are
-dequantized on read with the checkpoint's per-layer KV scales, or 1.0 when it has none.
-The speedup grows with the number of cached tokens each decode step reads, so it is small
-at short contexts; check accuracy against an fp16 cache before relying on it.
+that is a multiple of 128. It does not raise capacity: the platform pins the block count
+to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
+same number of tokens in half the device memory. Attention still computes in the model
+dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
+when it has none. The speedup grows with the number of cached tokens each decode step
+reads, so it is small at short contexts; check accuracy against an fp16 cache before
+relying on it.
+
+The scales are compiled into the graphs as constants. A checkpoint whose layers carry
+different KV scales therefore compiles the transformer block and each recorded attention
+kernel once per distinct pair of scales, which lengthens warmup; one without scales
+compiles them once, as an fp16 cache does.
+
+## Offline engine in the calling process
+
+At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline
+`LLM` engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. `vllm serve` always spawns EngineCore.
+
+The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves `RANK`/`WORLD_SIZE`
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with `tensor_parallel_size > 1` in a new process. Set
+`OMP_WAIT_POLICY=PASSIVE` before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.
 
 ## pyproject.toml Reference
 

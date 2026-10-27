@@ -26,7 +26,6 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -37,19 +36,32 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
-from .fp8_linear_kernel import _spyre_fp8_kernel
+from spyre_inference import envs
 
 logger = init_logger(__name__)
-
-# A row-parallel layer at least this many rows long all-gathers its input instead of
-# all-reducing its output. Below it, decode's few rows make the host-staged transfer's
-# fixed cost dominate, so moving fewer bytes does not pay for the larger local GEMM.
-_GATHER_INPUT_MIN_ROWS = 256
 
 # torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
 # full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
+_TRANSPOSE_BLOCK_ROWS = 128
+
+
+def _transpose_contiguous(w: torch.Tensor) -> torch.Tensor:
+    """`w.t().contiguous()`, bit-identical. PyTorch copies a 2-D transpose on one thread;
+    with SPYRE_BLOCKED_TRANSPOSE a 2-D CPU `w` is copied 128 source rows at a time, which
+    runs on torch's CPU threads and keeps each block's reads and writes in cache."""
+    if not (
+        envs.SPYRE_BLOCKED_TRANSPOSE
+        and w.dim() == 2
+        and w.device.type == "cpu"
+        and not w.t().is_contiguous()
+    ):
+        return w.t().contiguous()
+    out = torch.empty((w.shape[1], w.shape[0]), dtype=w.dtype, device=w.device)
+    for i in range(0, w.shape[0], _TRANSPOSE_BLOCK_ROWS):
+        out[:, i : i + _TRANSPOSE_BLOCK_ROWS].copy_(w[i : i + _TRANSPOSE_BLOCK_ROWS].t())
+    return out
 
 
 def spyre_linear_t(
@@ -116,9 +128,10 @@ class SpyreTransposedWeightMethod:
             w = padded
 
         # Store transposed (`[in, out]`, contiguous) so the forward GEMM is the
-        # Spyre-fast `x @ A`. `.t().contiguous()` gives INDEPENDENT storage, so a
-        # distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
-        setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+        # Spyre-fast `x @ A`. The transpose is a copy unless `w.t()` is already
+        # contiguous (a single row, or a transposed view). Loaded weights never are,
+        # so a distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
+        setattr(layer, self.WEIGHT_T_ATTR, Parameter(_transpose_contiguous(w), requires_grad=False))
 
     def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
         return False
@@ -179,7 +192,7 @@ class _SpyreTransposedLinearMixin:
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the
     layer normally; we then replace the unquantized method with the transposed
     one. Quantized layers keep their own method: FP8 uses
-    ``SpyreFp8LinearKernel`` (``aten._scaled_mm``). The transpose fast path only
+    ``SpyreFp8LinearKernel`` (``spyre.scaled_mm``). The transpose fast path only
     applies to unquantized weights.
     """
 
@@ -205,39 +218,7 @@ class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnP
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
 class SpyreRowParallelLinear(_SpyreTransposedLinearMixin, RowParallelLinear):
-    """OOT RowParallelLinear (e.g. o_proj, down_proj) storing `Wᵀ`.
-
-    TP collectives cross the host, so their cost is the bytes each rank moves. An
-    all-reduce of the ``[T, N]`` output moves ``4·T·N`` (fp16 out, sum back), and an
-    all-gather of the ``[T, K / tp]`` input ``2·T·K``. When ``K < 2·N`` (o_proj, not
-    down_proj) and the FP8 kernel holds the full weight (``weight_full``), a long
-    enough input is gathered and the whole GEMM runs on every rank.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.gathers_input = (
-            self.tp_size > 1
-            and self.reduce_results
-            and self.input_is_parallel
-            and self.input_size < 2 * self.output_size
-        )
-
-    def forward(self, input_):
-        weight_full = getattr(self, "weight_full", None)
-        rows = input_.numel() // input_.shape[-1]
-        # A trace-time branch: each compiled token bucket takes one path.
-        if weight_full is None or rows < _GATHER_INPUT_MIN_ROWS:
-            return super().forward(input_)
-        kernel = _spyre_fp8_kernel(self)
-        assert kernel is not None, "weight_full is only set by SpyreFp8LinearKernel"
-        x = tensor_model_parallel_all_gather(input_, dim=-1)
-        # Every rank now holds the whole output, so each adds the whole bias.
-        bias = None if self.skip_bias_add else self.bias
-        output = kernel.apply_fp8(x, weight_full, self.weight_scale, bias)
-        if not self.return_bias:
-            return output
-        return output, self.bias if self.skip_bias_add else None
+    """OOT RowParallelLinear (e.g. o_proj, down_proj) storing `Wᵀ`."""
 
 
 @ReplicatedLinear.register_oot(name="ReplicatedLinear")
