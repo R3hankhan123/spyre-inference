@@ -275,7 +275,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
     page_index_tables_cpu: list[torch.Tensor] | None = None
 
     # Per sequence, the device index table each kernel gathers pages with, built from
-    # page_index_tables_cpu on the step's first layer since the builder's device is CPU.
+    # page_index_tables_cpu the first time a layer reads it, since the builder's device
+    # is CPU. None until then, both the list and each entry.
     # Its shape is the kernel's business, so a caller driving two impls over one step's
     # metadata has to clear this between them.
     kernel_index_tables: list | None = None
@@ -1787,20 +1788,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out,
         )
 
-    def build_index_tables(
-        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
-    ) -> list:
-        """Per sequence, the device index table this impl's kernel gathers pages with."""
+    def build_index_table(
+        self, attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
+    ) -> torch.Tensor:
+        """One sequence's device index table, the one this impl's kernel gathers pages with."""
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
-        # Fresh offset-0 allocations (torch-spyre#3770).
-        return [convert(table, device=device) for table in tables_cpu]
+        # A fresh offset-0 allocation (torch-spyre#3770).
+        return convert(tables_cpu[seq_idx], device=device)
 
-    def index_tables(self, attn_metadata: "SpyreAttentionMetadata", device: torch.device) -> list:
-        """`build_index_tables`, memoized so only the step's first layer pays for it."""
-        if attn_metadata.kernel_index_tables is None:
-            attn_metadata.kernel_index_tables = self.build_index_tables(attn_metadata, device)
-        return attn_metadata.kernel_index_tables
+    def index_table(
+        self, attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
+    ) -> torch.Tensor:
+        """`build_index_table`, memoized so only the step's first layer pays for it.
+
+        Mirrored at the read site, like the mask stacks: a sequence the batched kernel
+        serves never reads its table, so a decode-only step uploads none.
+        """
+        tables = attn_metadata.kernel_index_tables
+        if tables is None:
+            tables = [None] * attn_metadata.num_seqs
+            attn_metadata.kernel_index_tables = tables
+        if tables[seq_idx] is None:
+            tables[seq_idx] = self.build_index_table(attn_metadata, seq_idx, device)
+        return tables[seq_idx]
 
     def _run_page_attn(
         self,
@@ -1873,7 +1884,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
 
@@ -1945,7 +1955,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
             # cache key misses. Narrowing belongs before the convert, not here.
-            index_table = index_tables[seq_idx]
+            index_table = self.index_table(attn_metadata, seq_idx, _target_device)
             mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
             # Indexed by position within active_bs; a prefix keeps storage_offset 0.
             mask_stack = mask_stack[: len(active_bs)]

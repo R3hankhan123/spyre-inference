@@ -1478,6 +1478,41 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
         assert stack_device.storage_offset() == 0
 
 
+def test_page_index_tables_are_mirrored_lazily_per_sequence(default_vllm_config, monkeypatch):
+    """A sequence the batched kernel serves never reads its page table, so it never uploads.
+
+    Mirroring every table before the batched early return cost a decode-only step one H2D
+    per sequence for tables nothing read.
+    """
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata([(1, 512), (1, 320), (7, 320)], block_size=64)
+    tables_cpu = metadata.page_index_tables_cpu
+    assert tables_cpu is not None
+
+    calls: list[torch.Tensor] = []
+
+    def counting_convert(tensor, device=None, dtype=None):
+        calls.append(tensor)
+        return tensor.clone()
+
+    monkeypatch.setattr(spyre_attn, "convert", counting_convert)
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=0.125, num_kv_heads=8)
+    device = torch.device("cpu")
+
+    # A mixed batch whose decode prefix the batched kernel served reads only the suffix.
+    table = impl.index_table(metadata, 2, device)
+    assert calls == [tables_cpu[2]]
+    assert torch.equal(table, tables_cpu[2])
+    assert metadata.kernel_index_tables is not None
+    assert metadata.kernel_index_tables[:2] == [None, None]
+
+    # Later layers reuse the mirror.
+    assert impl.index_table(metadata, 2, device) is table
+    assert calls == [tables_cpu[2]]
+
+
 def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=4)
