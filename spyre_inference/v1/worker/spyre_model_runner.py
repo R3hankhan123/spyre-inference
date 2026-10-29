@@ -636,11 +636,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # guard on their unset value and the first real prefill recompiles the block.
         self._resolve_kv_scales()
 
-        # Move layer weights to Spyre device.
-        self.model.to(device=self._spyre_device)
-        for module in self.model.modules():
-            if isinstance(module, SpyreConv2d):
-                module.process_weights_after_loading()
+        move_model_to_spyre(self.model, self._spyre_device)
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
         # falls back to the host elsewhere. FP32 linear heads stay on CPU.
@@ -678,59 +674,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
         )
-
-    @staticmethod
-    def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linear layers in its blocks.
-
-        ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
-        Granite ``compressed-tensors`` stores it on the scheme
-        (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
-        """
-        from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
-
-        def _is_fp8_kernel(obj: object) -> bool:
-            return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
-                getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
-            )
-
-        for module in model.modules():
-            weight = getattr(module, "weight", None)
-            if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
-                return True
-            quant_method = getattr(module, "quant_method", None)
-            if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
-                getattr(quant_method, "scheme", None)
-            ):
-                return True
-            if _is_fp8_kernel(getattr(module, "scheme", None)):
-                return True
-        return False
-
-    @staticmethod
-    def _initialize_fp8_lm_head(model: nn.Module, quant_config: object) -> None:
-        """Run each ``SpyreParallelLMHead`` in FP8 when the body's linears are FP8.
-
-        Post-load, because ``get_quant_method`` hands an embedding
-        ``UnquantizedEmbeddingMethod`` whatever the config, so construction cannot tell.
-        """
-        if not TorchSpyreModelRunner._model_has_spyre_fp8(model):
-            return
-        from spyre_inference.custom_ops.parallel_lm_head import (
-            SpyreParallelLMHead,
-            checkpoint_quantizes_head,
-        )
-
-        for module in model.modules():
-            if not isinstance(module, SpyreParallelLMHead):
-                continue
-            if not checkpoint_quantizes_head(module, quant_config):
-                logger.info("LM head %r stays FP16, as the checkpoint asks.", module.prefix)
-            elif not module.fp8_compile_enabled:
-                logger.info("LM head %r stays FP16 under enforce_eager.", module.prefix)
-            else:
-                module.initialize_fp8()
-                logger.info("LM head %r projects in FP8.", module.prefix)
 
     def _resolve_kv_scales(self) -> bool:
         """Read each float8-cache layer's KV scales into its impl; True when any changed."""

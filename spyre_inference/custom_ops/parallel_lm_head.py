@@ -17,10 +17,11 @@
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
-    - Quantization: FP8 models use ``SpyreFp8LMHeadMethod`` (one
+    - Quantization: FP8 W8A8 models use ``SpyreFp8LMHeadMethod`` (one
       ``spyre.scaled_mm`` against a DMA'd ``qfp8wt`` weight) unless the checkpoint
       keeps the head unquantized or the model runs eagerly; all others use the
-      unquantized transposed-weight fast path.
+      unquantized transposed-weight fast path. Chosen at construction, as vLLM
+      chooses a linear's quant method.
 """
 
 from typing import cast
@@ -104,6 +105,10 @@ class SpyreFp8LMHeadMethod(SpyreUnquantizedLMHeadMethod):
         setattr(
             layer, self.WEIGHT_T_ATTR, Parameter(_dma_checkpoint_qfp8wt(q), requires_grad=False)
         )
+        # A reload after the device move must leave the scale where the GEMM reads it.
+        old_scale = getattr(layer, "weight_scale", None)
+        if old_scale is not None:
+            scale = convert(scale, device=old_scale.device)
         layer.weight_scale = Parameter(scale, requires_grad=False)
 
     def apply(
@@ -142,6 +147,29 @@ class SpyreFp8LMHeadMethod(SpyreUnquantizedLMHeadMethod):
         if padding:
             out = out[:, :-padding]
         return out
+
+
+def quantizes_body_in_fp8(quant_config: object) -> bool:
+    """True when ``quant_config`` puts the model's linears on ``SpyreFp8LinearKernel``.
+
+    That kernel serves FP8 W8A8: every ``Fp8Config``, and a compressed-tensors
+    checkpoint whose schemes are FP8 weights with FP8 activations.
+    """
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    if isinstance(quant_config, Fp8Config):
+        return True
+    if isinstance(quant_config, CompressedTensorsConfig):
+        return any(
+            CompressedTensorsConfig._is_fp8_w8a8(
+                scheme.get("weights"), scheme.get("input_activations")
+            )
+            for scheme in quant_config.target_scheme_map.values()
+        )
+    return False
 
 
 def checkpoint_quantizes_head(head: torch.nn.Module, quant_config: object) -> bool:
@@ -183,20 +211,9 @@ class SpyreParallelLMHead(ParallelLMHead):
     ``LogitsProcessor._apply_head`` → ``lm_head.quant_method.apply``. The base
     ``ParallelLMHead.forward`` raises and is unused.
 
-    ``quant_method`` starts as ``SpyreUnquantizedLMHeadMethod``;
-    ``TorchSpyreModelRunner._initialize_fp8_lm_head`` may upgrade it post-load.
+    vLLM's FP8 configs give an LM head no quant method, so the FP8 one is chosen here
+    from the same config, and the loader's ``process_weights_after_loading`` quantizes it.
     """
-
-    @property
-    def fp8_compile_enabled(self) -> bool:
-        """``spyre.scaled_mm`` only runs compiled, and eager mode pads no logits rows."""
-        return self._spyre_fp8_lm_head_method.spyre_compile_enabled
-
-    def initialize_fp8(self) -> None:
-        """Quantize and DMA the host ``padded_weight_t``, then switch to the FP8 method."""
-        method = self._spyre_fp8_lm_head_method
-        method.quantize_weight_t(self)
-        self.quant_method = method
 
     def _apply(self, fn, recurse=True):
         # The GEMM reads `padded_weight_t`; once it exists `weight` is runtime-dead, so
@@ -216,8 +233,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
 
-        # Only UnquantizedEmbeddingMethod is supported at construction time.
-        # _initialize_fp8_lm_head may upgrade this to SpyreFp8LMHeadMethod post-load.
+        # A checkpoint-quantized head (AWQ/GPTQ `lm_head_quantized`) is not supported.
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
                 f"SpyreParallelLMHead does not support {type(self.quant_method).__name__}."
@@ -225,6 +241,14 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         logger.debug("Building SpyreParallelLMHead with TP size %d", self.tp_size)
         self.quant_method = SpyreUnquantizedLMHeadMethod()
-        # The FP8 upgrade runs post-load, when the vLLM config context is no longer
-        # active. Sample its compile policy now, as SpyreVocabParallelEmbedding does.
-        self._spyre_fp8_lm_head_method = SpyreFp8LMHeadMethod()
+        if not quantizes_body_in_fp8(self.quant_config):
+            return
+        fp8_method = SpyreFp8LMHeadMethod()
+        if not checkpoint_quantizes_head(self, self.quant_config):
+            logger.info("LM head %r stays FP16, as the checkpoint asks.", self.prefix)
+        elif not fp8_method.spyre_compile_enabled:
+            # `spyre.scaled_mm` only runs compiled, and eager mode pads no logits rows.
+            logger.info("LM head %r stays FP16 under enforce_eager.", self.prefix)
+        else:
+            self.quant_method = fp8_method
+            logger.info("LM head %r projects in FP8.", self.prefix)
