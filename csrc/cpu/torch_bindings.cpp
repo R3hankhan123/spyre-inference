@@ -20,10 +20,16 @@
 
 #include "core/registration.h"
 
-torch::Tensor fused_gumbel_argmax(const torch::Tensor& logits,
-                                  const torch::Tensor& seeds);
+torch::Tensor fused_gumbel_argmax(
+    const torch::Tensor& logits, const torch::Tensor& seeds,
+    const std::optional<torch::Tensor>& positions);
 
 torch::Tensor greedy_argmax(const torch::Tensor& logits);
+
+void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p);
+void cpu_topk_sampling(torch::Tensor& logits, const torch::Tensor& k);
+void cpu_topk_topp_sampling(torch::Tensor& logits, const torch::Tensor& k,
+                            const torch::Tensor& p);
 
 namespace cpu_utils {
 void rejection_greedy_sample_kernel_impl(
@@ -58,11 +64,21 @@ void sample_recovered_tokens_kernel_impl(
 // A fixed namespace rather than TORCH_EXTENSION_NAME: every ISA variant
 // registers the same ops, and `_spyre_C` cannot collide with a vLLM `_C` build.
 TORCH_LIBRARY(_spyre_C, ops) {
-  ops.def("fused_gumbel_argmax(Tensor logits, Tensor seeds) -> Tensor");
+  ops.def(
+      "fused_gumbel_argmax(Tensor logits, Tensor seeds, "
+      "Tensor? positions=None) -> Tensor");
   ops.impl("fused_gumbel_argmax", torch::kCPU, &fused_gumbel_argmax);
 
   ops.def("greedy_argmax(Tensor logits) -> Tensor");
   ops.impl("greedy_argmax", torch::kCPU, &greedy_argmax);
+
+  // In-place top-k / top-p masking (vendored vLLM CPU kernels).
+  ops.def("cpu_topp_sampling(Tensor! logits, Tensor p) -> ()");
+  ops.impl("cpu_topp_sampling", torch::kCPU, &cpu_topp_sampling);
+  ops.def("cpu_topk_sampling(Tensor! logits, Tensor k) -> ()");
+  ops.impl("cpu_topk_sampling", torch::kCPU, &cpu_topk_sampling);
+  ops.def("cpu_topk_topp_sampling(Tensor! logits, Tensor k, Tensor p) -> ()");
+  ops.impl("cpu_topk_topp_sampling", torch::kCPU, &cpu_topk_topp_sampling);
 
   ops.def(
       "rejection_greedy_sample_kernel_impl("

@@ -223,10 +223,10 @@ class TorchSpyrePlatform(CpuPlatform):
         @functools.wraps(create_model_config)
         def _spyre_create_model_config(self):
             from spyre_inference.models import apply_prelaunch_overrides
-            from spyre_inference.v1.spec_decode.config import normalize_speculative_config
+            from spyre_inference.v1.spec_decode import registry
 
             apply_prelaunch_overrides(self)
-            normalize_speculative_config(self)
+            registry.normalize_engine_args(self)
             return create_model_config(self)
 
         EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
@@ -363,6 +363,8 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
+                from vllm.v1.attention.backend import max_decode_query_len
+
                 # Decode packs one token per running sequence; prefill lands on
                 # the largest bucket. Denser sizes only cost warmup time. The budget
                 # is the user's only if it still equals what they passed: a config
@@ -383,14 +385,24 @@ class TorchSpyrePlatform(CpuPlatform):
                         max_capture_size,
                     )
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                sizes = {max_capture_size, num_seqs}
+                seq_ladder = {num_seqs}
+                size = 1
+                while size < num_seqs:
+                    seq_ladder.add(size)
+                    size *= 2
+                sizes = {max_capture_size, *seq_ladder}
                 # Short prefills keep a default-size bucket instead of padding up.
                 if max_capture_size > prefill:
                     sizes.add(prefill)
-                size = 1
-                while size < num_seqs:
-                    sizes.add(size)
-                    size *= 2
+                # Speculative decoding: a decode step packs up to 1 + k tokens per
+                # running sequence, so n sequences fill n..n*(1+k) rows. Without
+                # buckets in that range such a step pads up to the prefill bucket,
+                # running the whole body at 512 rows for a few dozen real ones.
+                # One bucket per sequence-ladder rung keeps the padding bounded by
+                # that rung's width. 1 (a no-op here) when speculation is off.
+                verify_len = max_decode_query_len(vllm_config)
+                if verify_len > 1:
+                    sizes |= {min(n * verify_len, max_capture_size) for n in seq_ladder}
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
@@ -779,6 +791,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
+        from spyre_inference.v1.spec_decode import registry
+
+        spec_method = registry.resolve(vllm_config.speculative_config)
+        if spec_method is not None:
+            spec_method.check_config(vllm_config)
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
@@ -922,6 +940,9 @@ class TorchSpyrePlatform(CpuPlatform):
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
                 max_model_len = vllm_config.model_config.max_model_len
+                # The scheduler reserves slots for the next step's drafts too.
+                if vllm_config.speculative_config is not None:
+                    max_model_len += vllm_config.speculative_config.num_speculative_tokens or 0
                 blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
                 # +1 for BlockPool's reserved null block, which is never allocatable.
                 cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1

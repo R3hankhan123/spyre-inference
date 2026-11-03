@@ -180,6 +180,12 @@ class TorchSpyreWorker(Worker):
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
 
+        from spyre_inference.v1.spec_decode import registry
+
+        spec_method = registry.resolve(self.speculative_config)
+        if spec_method is not None:
+            spec_method.before_warmup(self)
+
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time

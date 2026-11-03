@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from contextlib import AbstractContextManager, contextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -27,8 +28,11 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.spec_decode.base import SpyreSpecMethod
 
 if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig, VllmConfig
+
     from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
 
 
@@ -180,3 +184,79 @@ class SpyreDFlashProposer(DFlashProposer):
                 positions=convert(positions, self.spyre_device),
             )
         return self.model.propose_block(hidden, ids[:1])
+
+
+class DFlashMethod(SpyreSpecMethod):
+    """DFlash and Qwen3 XPress (``method="xpress"`` is normalized to DFlash)."""
+
+    name = "dflash"
+    records_draft_attention = True
+
+    @classmethod
+    def matches(cls, spec: SpeculativeConfig) -> bool:
+        return spec.use_dflash()
+
+    @classmethod
+    def normalize_engine_args(cls, engine_args: Any) -> None:
+        from spyre_inference.v1.spec_decode.config import normalize_speculative_config
+
+        normalize_speculative_config(engine_args)
+
+    def validate_runner(self, vllm_config: VllmConfig) -> None:
+        from spyre_inference.v1.spec_decode.config import validate_dflash_config
+
+        validate_dflash_config(vllm_config)
+
+    def proposer_context(self) -> AbstractContextManager:
+        return use_spyre_dflash_proposer()
+
+    def load_drafter(self, runner: Any) -> None:
+        runner.drafter.load_model(runner.model)
+
+    def place_drafter(self, runner: Any) -> None:
+        from spyre_inference.v1.worker.model_load import move_model_to_spyre
+
+        assert isinstance(runner.drafter, SpyreDFlashProposer)
+        move_model_to_spyre(runner.drafter.model, runner._spyre_device)
+        runner.drafter.model.prepare_for_spyre()
+
+    def input_fits_in_drafter(
+        self, runner: Any, upstream: Callable[[Any], bool], common_attn_metadata: Any
+    ) -> bool:
+        # Commit each request's context, then decide which individual drafts fit.
+        return common_attn_metadata is not None
+
+    def propose(self, runner: Any, upstream: Callable[..., Any], *args: Any) -> Any:
+        (
+            scheduler_output,
+            sampled_token_ids,
+            _sampling_metadata,
+            _hidden_states,
+            _sample_hidden_states,
+            aux_hidden_states,
+            spec_decode_metadata,
+            common_attn_metadata,
+            _slot_mappings,
+        ) = args
+        # Greedy proposals use the rejection sampler's point-mass distribution,
+        # including when the target uses stochastic sampling.
+        runner._draft_probs = None
+        runner._draft_prob_req_ids = None
+        # CPU bookkeeping has already appended this step's sampled tokens.
+        at_output_limit = []
+        for request_id in runner.input_batch.req_ids:
+            request = runner.requests[request_id]
+            params = request.sampling_params
+            assert params is not None
+            at_output_limit.append(
+                params.max_tokens is not None and len(request.output_token_ids) >= params.max_tokens
+            )
+        return cast(SpyreDFlashProposer, runner.drafter).propose_spyre(
+            sampled_token_ids,
+            aux_hidden_states,
+            runner._get_positions(scheduler_output.total_num_scheduled_tokens),
+            spec_decode_metadata,
+            common_attn_metadata,
+            skip_proposal=at_output_limit,
+            max_model_len=runner.effective_drafter_max_model_len,
+        )

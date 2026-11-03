@@ -1,4 +1,45 @@
-# XPress speculative decoding
+# Speculative decoding
+
+Spyre supports four speculative-decoding methods. Each is a plug-in
+(`spyre_inference/v1/spec_decode/`); verification is shared by all of them.
+
+| Method | `--speculative-config` | Drafter | Limits |
+|---|---|---|---|
+| n-gram | `{"method": "ngram", "num_speculative_tokens": k}` | none (prompt lookup on the host) | — |
+| suffix | `{"method": "suffix", "num_speculative_tokens": k}` | none (suffix tree on the host) | needs `arctic-inference` |
+| Gemma-4 MTP | `{"method": "mtp", "model": "<gemma-4 assistant>", "num_speculative_tokens": k}` | Gemma-4 assistant checkpoint, reading the target's KV cache | Gemma-4 targets |
+| XPress / DFlash | see [below](#xpress) | Qwen3 XPress checkpoint | TP=1, one request |
+
+Any other method is rejected at startup with the list above.
+
+**Shared verification.** A verification step packs `1 + k` tokens per running
+sequence. The default compile sizes and attention query buckets add that width (see
+[Configuration](configuration.md)), the scheduler pads every draft list to `k` so each
+verification has one width, and the batched decode kernel serves it. Rejection
+sampling runs on the fused C++ kernels in `csrc/cpu/spec_decode_utils.cpp`; build the
+CPU extension before serving.
+
+**Adding a method.** Subclass `SpyreSpecMethod` (`spec_decode/base.py`), override only
+the hooks the method needs (every default is upstream's behaviour), and add it to
+`registry.METHODS`. A drafter that attends through the target's attention builders
+sets `draft_query_len` so warmup records the batched kernel at its width; one with KV
+layers of its own sets `records_draft_attention`.
+
+## Gemma-4 MTP
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it -tp 4 --max-model-len 32768 --max-num-seqs 32 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}' \
+  --speculative-config '{"method": "mtp", "model": "<gemma-4-26B-A4B-it assistant>", "num_speculative_tokens": 4}'
+```
+
+The assistant is compiled per block like the target and drafts one token per request
+per pass, at the decode buckets. Its context is extended to the target's
+`--max-model-len`, and async scheduling is turned off: Spyre runs speculative decoding
+synchronously. Under tensor parallelism the assistant's pre/post projections are held
+whole on every rank, so drafting runs no collective.
+
+## XPress
 
 XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
 the target model verify the proposals. The experimental Spyre integration loads
@@ -9,7 +50,7 @@ Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
 the V1 runner, one active request, and prefix caching
 disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
 
-## Run Qwen3-8B
+### Run Qwen3-8B
 
 ```bash
 export SPYRE_MODEL_RUNNER=v1
@@ -33,7 +74,7 @@ checkpoint revisions as this example; update all three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.
 
-## Refinement and compatibility
+### Refinement and compatibility
 
 The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):
 a fixed anchor, causal Jacobi updates, a block-wide hidden summary, and candidate
@@ -60,7 +101,7 @@ runner is operational, XPress needs its auxiliary-state, draft-context and
 CPU-sampling hooks ported to V2's speculator interface. See
 [the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
 
-## Validation
+### Validation
 
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'

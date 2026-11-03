@@ -19,6 +19,9 @@ import pytest
 import torch
 from vllm.config import CompilationMode
 
+from spyre_inference.v1.spec_decode.dflash import DFlashMethod
+from spyre_inference.v1.spec_decode.gemma4_mtp import Gemma4MtpMethod
+from spyre_inference.v1.spec_decode.ngram import NgramMethod
 from spyre_inference.v1.worker import spyre_model_runner
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -70,7 +73,8 @@ def recording_runner(monkeypatch):
         _spyre_kv_caches={"target": object(), "draft.0": object(), "draft.1": object()},
         attn_groups=[[SimpleNamespace(layer_names=["target"])]],
         _attn_metadata_builders=lambda: {},
-        speculative_config=object(),
+        # A drafter with KV layers of its own, as DFlash's.
+        _spec_method=DFlashMethod(),
         drafter=SimpleNamespace(
             model=SimpleNamespace(
                 get_draft_kv_cache_layer_names=lambda: ["draft.0", "draft.1"],
@@ -87,13 +91,23 @@ def recording_runner(monkeypatch):
 def test_attention_warmup_reads_causality_from_draft_model(recording_runner, with_draft):
     runner, record = recording_runner
     if not with_draft:
-        runner.speculative_config = None
+        runner._spec_method = None
         runner._spyre_kv_caches = {"target": object()}
     TorchSpyreModelRunner._record_attention_graphs(runner)
     expected = (
         {"target": True, "draft.0": False, "draft.1": True} if with_draft else {"target": True}
     )
     assert record.call_args.kwargs["causal_by_layer"] == expected
+
+
+def test_attention_warmup_skips_model_free_proposer(recording_runner):
+    runner, record = recording_runner
+    # An ngram proposer has no model and no draft layers.
+    runner._spec_method = NgramMethod()
+    runner.drafter = SimpleNamespace()
+    runner._spyre_kv_caches = {"target": object()}
+    TorchSpyreModelRunner._record_attention_graphs(runner)
+    assert record.call_args.kwargs["causal_by_layer"] == {"target": True}
 
 
 def test_attention_warmup_requires_draft_model_causality(recording_runner):
@@ -110,3 +124,20 @@ def test_attention_warmup_rejects_misaligned_draft_causality(recording_runner):
     with pytest.raises(ValueError, match="zip"):
         TorchSpyreModelRunner._record_attention_graphs(runner)
     record.assert_not_called()
+
+
+def test_attention_warmup_takes_a_kv_sharing_drafter_from_the_attention_groups(
+    recording_runner,
+):
+    """Gemma-4 MTP's layers read the target's KV and sit in its groups, as causal layers.
+
+    vLLM's ``uses_draft_kv_cache()`` is True for ``mtp``, but its model reports no draft
+    KV layers, so asking it would raise.
+    """
+    runner, record = recording_runner
+    runner._spec_method = Gemma4MtpMethod()
+    runner.attn_groups = [[SimpleNamespace(layer_names=["target", "draft.0"])]]
+    runner._spyre_kv_caches = {"target": object(), "draft.0": object()}
+    runner.drafter = SimpleNamespace(model=SimpleNamespace())
+    TorchSpyreModelRunner._record_attention_graphs(runner)
+    assert record.call_args.kwargs["causal_by_layer"] == {"target": True, "draft.0": True}

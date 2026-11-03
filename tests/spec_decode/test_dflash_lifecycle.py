@@ -20,7 +20,7 @@ import torch
 
 from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3Model
 from spyre_inference.v1.spec_decode import dflash
-from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
+from spyre_inference.v1.spec_decode.dflash import DFlashMethod, SpyreDFlashProposer
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 
@@ -48,6 +48,7 @@ def test_output_limit_uses_tokens_already_appended_by_bookkeeping(
 
     runner = SimpleNamespace(
         speculative_config=SimpleNamespace(use_dflash=lambda: True),
+        _spec_method=DFlashMethod(),
         requests={
             "request": SimpleNamespace(
                 output_token_ids=[3] * output_count,
@@ -242,6 +243,7 @@ def test_partial_prefill_commits_context_without_a_proposal(proposer):
 def test_context_limit_replaces_previous_host_drafts_with_empty_rows(proposer):
     runner = SimpleNamespace(
         speculative_config=SimpleNamespace(use_dflash=lambda: True),
+        _spec_method=DFlashMethod(),
         input_batch=SimpleNamespace(req_ids=["request"]),
         use_async_scheduling=False,
     )

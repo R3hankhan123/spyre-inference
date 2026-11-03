@@ -20,10 +20,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
-from spyre_inference.v1.sample.topk_topp_sampler import (
-    SpyreTopKTopPSampler,
-    apply_top_k_top_p_sort_free,
-)
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 # Skip, like vLLM's optional extensions, where the kernels are absent (a prebaked image
 # without them, a dev checkout that never built them). CI's non-prebaked runs still fail
@@ -45,29 +42,51 @@ def test_greedy_matches_argmax(rows: int, vocab: int) -> None:
     assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))
 
 
-def _i64(x: int) -> int:
-    """A uint64 constant as the int64 bit pattern torch stores."""
-    return x - (1 << 64) if x >= 1 << 63 else x
+_U32 = 0xFFFFFFFF
 
 
-def _shr(x: torch.Tensor, n: int) -> torch.Tensor:
-    """Logical right shift of int64 tensors holding uint64 bits."""
-    return (x >> n) & ((1 << (64 - n)) - 1)
+def _rotl(v: torch.Tensor, s: int) -> torch.Tensor:
+    return ((v << s) | (v >> (32 - s))) & _U32
 
 
-def _splitmix64(z: torch.Tensor) -> torch.Tensor:
-    z = (z ^ _shr(z, 30)) * _i64(0xBF58476D1CE4E5B9)
-    z = (z ^ _shr(z, 27)) * _i64(0x94D049BB133111EB)
-    return z ^ _shr(z, 31)
+def _mix(h: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    k = _rotl((k * 0xCC9E2D51) & _U32, 15)
+    h = _rotl(h ^ ((k * 0x1B873593) & _U32), 13)
+    return (h * 5 + 0xE6546B64) & _U32
 
 
-def _reference_gumbel_argmax(logits: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
-    """PyTorch baseline for fused_gumbel_argmax: the same hashed per-element noise, in
-    float64, with none of the kernel's pruning or rejection shortcuts."""
-    i = torch.arange(1, logits.shape[1] + 1, dtype=torch.int64)
-    key = _splitmix64(seeds.to(torch.int64)).unsqueeze(1)
-    bits = _shr(_splitmix64(key + i * _i64(0x9E3779B97F4A7C15)), 11)
-    u = (bits.double() + 0.5) * 2.0**-53
+def _fmix(h: torch.Tensor) -> torch.Tensor:
+    h = ((h ^ (h >> 16)) * 0x85EBCA6B) & _U32
+    h = ((h ^ (h >> 13)) * 0xC2B2AE35) & _U32
+    return h ^ (h >> 16)
+
+
+def _hash32(seeds, positions, tokens, domain):
+    h = torch.full_like(seeds, domain)
+    h = _mix(h, seeds & _U32)
+    h = _mix(h, (seeds >> 32) & _U32)
+    h = _mix(h, positions & _U32)
+    return _fmix(_mix(h, tokens) ^ 16)
+
+
+def murmur3_uniform64(seeds, positions, vocab):
+    """vLLM's cpu_sampling::murmur3_uniform64, [rows] x [vocab], in int64 lanes."""
+    seeds, positions = seeds.unsqueeze(1), positions.unsqueeze(1)
+    tokens = torch.arange(vocab, dtype=torch.int64).unsqueeze(0)
+    low = _hash32(seeds, positions, tokens, 0)
+    high = _hash32(seeds, positions, tokens, 0x9E3779B9)
+    u = (((high << 21) | (low >> 11)).double() + 0.5) * 2.0**-53
+    return torch.where(u == 1.0, u - 2.0**-53, u)
+
+
+def _reference_gumbel_argmax(
+    logits: torch.Tensor, seeds: torch.Tensor, positions: torch.Tensor | None = None
+) -> torch.Tensor:
+    """PyTorch baseline for fused_gumbel_argmax: vLLM's counter-based noise, in float64,
+    with none of the kernel's pruning or rejection shortcuts."""
+    if positions is None:
+        positions = torch.zeros_like(seeds)
+    u = murmur3_uniform64(seeds.to(torch.int64), positions.to(torch.int64), logits.shape[1])
     return (logits.double() - torch.log(-torch.log(u))).argmax(dim=-1)
 
 
@@ -102,14 +121,25 @@ def test_topk_sampler_matches_pytorch_reference(k: int | None, p: float | None) 
     torch.manual_seed(1)
     out = sampler.forward_native(logits.clone(), {}, k_t, p_t)[0]
 
-    # The sampler's own filter, then its per-row seed draw.
-    if k_t is not None and p_t is not None:
-        filtered = apply_top_k_top_p_sort_free(logits.clone(), k_t, p_t)
-    else:
-        filtered = apply_top_k_top_p_pytorch(logits.clone(), k_t, p_t, allow_cpu_sync=True)
+    # vLLM's exact filter (no ties in these logits), then the sampler's per-row seed draw.
+    filtered = apply_top_k_top_p_pytorch(logits.clone(), k_t, p_t, allow_cpu_sync=True)
     torch.manual_seed(1)
     seeds = torch.randint(0, 2**62, (rows,), dtype=torch.long)
     assert torch.equal(out, _reference_gumbel_argmax(filtered, seeds))
+
+
+def test_gumbel_positions_key_the_noise() -> None:
+    """A row's position is part of the key, as in vLLM: same seed, new draw."""
+    torch.manual_seed(3)
+    logits = torch.randn(32, 4096)
+    seeds = torch.full((32,), 1234, dtype=torch.long)
+    positions = torch.arange(32, dtype=torch.long) * 7919
+    out = torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds, positions)
+    assert torch.equal(out, _reference_gumbel_argmax(logits, seeds, positions))
+    zero = torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds, torch.zeros_like(positions))
+    assert torch.equal(zero, torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds))
+    with pytest.raises(RuntimeError, match="positions must be int64"):
+        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds, positions.int())
 
 
 def test_gumbel_matches_softmax_distribution() -> None:
@@ -188,3 +218,52 @@ def test_greedy_nan_matches_argmax() -> None:
     x[4, 10] = float("inf")
     x[4, 20] = float("-inf")  # inf + -inf: NaN sum without a NaN logit
     assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))
+
+
+# The vendored top-k/top-p kernels (csrc/cpu/topk_topp_sampler.cpp) against vLLM's exact
+# filter. Top-k matches exactly, ties at the k-th value included, as vLLM keeps them. A
+# tie straddling the top-p cutoff keeps arbitrary tied tokens in upstream's unstable
+# sort too, so top-p is compared by which tokens survive, within a tolerance.
+@pytest.mark.parametrize("ties", ["none", "fp16", "wide"])
+@pytest.mark.parametrize("mode", ["topk", "topp", "topk_topp"])
+@pytest.mark.parametrize("vocab", [4096, 151936])
+def test_topk_topp_kernels_match_vllm_filter(vocab: int, mode: str, ties: str) -> None:
+    from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_host
+
+    rows = 8
+    torch.manual_seed(vocab)
+    x = torch.randn(rows, vocab) * 3
+    if ties == "fp16":
+        x = x.half().float()
+    elif ties == "wide":
+        x[:, :300] = 20.0
+    x[1, torch.rand(vocab) < 0.5] = float("-inf")  # a masked row
+    # Mixed per-row k, with one row whose k leaves top-k off.
+    k = None if mode == "topp" else torch.tensor([vocab] + [64] * (rows - 1))
+    p = None if mode == "topk" else torch.rand(rows) * 0.5 + 0.5
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p, allow_cpu_sync=True)
+    actual = apply_top_k_top_p_host(x.clone(), k, p)
+    if mode == "topk":
+        assert torch.equal(actual, expected)
+        return
+    # Top-p keeps a prefix of the row by value, so compare the kept values in
+    # descending order; which of several tied tokens survive is arbitrary. s390x's
+    # vector exp is a polynomial, so a token at the cutoff may flip there: allow what
+    # upstream's own tests allow, under 0.5% of the kept tokens (x86's and the scalar
+    # exp match exactly).
+    for row, row_expected in zip(actual, expected):
+        got = row[~row.isinf()].sort(descending=True).values
+        want = row_expected[~row_expected.isinf()].sort(descending=True).values
+        n = min(got.numel(), want.numel())
+        assert abs(got.numel() - want.numel()) <= max(1, int(0.005 * want.numel()))
+        assert torch.equal(got[:n], want[:n])
+
+
+def test_topk_kernel_keeps_a_flat_row_whole() -> None:
+    """Every value ties with the k-th, so vLLM keeps them all."""
+    from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_host
+
+    x = torch.full((2, 1000), 1.5)
+    x[1, 500:] = float("-inf")
+    out = apply_top_k_top_p_host(x.clone(), torch.tensor([10, 10]), None)
+    assert torch.equal(out, x)

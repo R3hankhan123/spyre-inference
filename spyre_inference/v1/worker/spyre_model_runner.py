@@ -37,7 +37,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -89,6 +89,7 @@ from spyre_inference.v1.pool.encoder_grid import (
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.spec_decode import registry, rejection_sampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
@@ -115,9 +116,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     group_width_caps,
     logits_row_buckets,
 )
-
-if TYPE_CHECKING:
-    from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
 
 logger = init_logger(__name__)
 
@@ -535,6 +533,53 @@ class _SpyreModelWrapper:
             setattr(self._model, name, value)
 
 
+class _SpyreDraftModelWrapper(_SpyreModelWrapper):
+    """The MTP drafter's boundary, which also takes a float input: the target's hidden state.
+
+    The proposer, unlike the runner, never pads its batch, so every input is padded here
+    onto a compiled body bucket. Outputs come back to the host before the trim, avoiding
+    a dim-0 slice on device. With ``on_device`` they stay on the card, padded, and a
+    float input already there is taken as such: the previous pass's padded output.
+    """
+
+    def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds=None, on_device=False):
+        num_tokens = positions.shape[-1]
+        bucketer = self._shape_bucketer
+        padded = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        pad = 0 if padded is None else padded - num_tokens
+
+        def to_spyre(t: torch.Tensor | None, rows_last: bool) -> torch.Tensor | None:
+            if t is None:
+                return None
+            if t.device.type != "cpu":
+                assert t.shape[0] == num_tokens + pad, "an on-card input is already padded"
+                return t
+            if pad:
+                t = convert(t, device="cpu")
+                t = F.pad(t, (0, pad) if rows_last else (0, 0, 0, pad))
+            if t.is_floating_point():
+                return convert(t, device=self._spyre_device, dtype=self._model_dtype)
+            return convert(t, device=self._spyre_device, dtype=torch.int64)
+
+        result = self._model(
+            input_ids=to_spyre(input_ids, rows_last=True),
+            positions=to_spyre(positions, rows_last=True),
+            hidden_states=to_spyre(hidden_states, rows_last=False),
+            inputs_embeds=to_spyre(inputs_embeds, rows_last=False),
+        )
+        if on_device:
+            return result
+        return tuple(convert(t, device="cpu")[:num_tokens] for t in result)
+
+    def lm_head_takes_padded_rows(self, num_tokens: int) -> bool:
+        """Whether ``num_tokens``'s padded body bucket is a width the lm_head compiled at."""
+        bucketer = self._shape_bucketer
+        if bucketer is None:
+            return False
+        padded = bucketer.find_bucket(num_tokens)
+        return padded is not None and padded in self._logits_row_buckets
+
+
 class TorchSpyreModelRunner(GPUModelRunner):
     """Model runner for Spyre.
 
@@ -551,9 +596,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
 
-        from spyre_inference.v1.spec_decode.config import validate_dflash_config
-
-        validate_dflash_config(vllm_config)
+        # The speculative method's hooks; None without speculative decoding.
+        self._spec_method = registry.resolve(vllm_config.speculative_config)
+        if self._spec_method is not None:
+            self._spec_method.validate_runner(vllm_config)
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
@@ -586,16 +632,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Spyre doesn't support all dtypes (int32, bool) natively.
         # _make_buffer (overridden below) already places .gpu on Spyre
         # via self._spyre_device regardless of self.device.
-        from spyre_inference.v1.spec_decode.dflash import use_spyre_dflash_proposer
-
-        with _torch_cuda_wrapper(), use_spyre_dflash_proposer():
+        spec_method = self._spec_method
+        with (
+            _torch_cuda_wrapper(),
+            spec_method.proposer_context() if spec_method is not None else nullcontext(),
+        ):
             super().__init__(vllm_config, torch.device("cpu"))
+        if spec_method is not None:
+            spec_method.replace_proposer(self)
         # Patch upstream's Sampler in place, so every holder of it (e.g. the
         # RejectionSampler) takes the host-side draws.
         self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
             self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
         )
         self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
+        if self.speculative_config is not None:
+            rejection_sampler.install()
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
@@ -643,15 +695,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.lora_config:
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
-        if hasattr(self, "drafter") and (
-            self.speculative_config is None or not self.speculative_config.use_dflash()
-        ):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
-
-        if self.speculative_config and self.speculative_config.use_dflash():
-            self.drafter.load_model(self.model)
+        if self._spec_method is not None:
+            self._spec_method.load_drafter(self)
 
         fix_padded_model(self.model, self.model_config)
 
@@ -660,12 +705,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         resolve_kv_scales(self.model, self.compilation_config.static_forward_context)
 
         move_model_to_spyre(self.model, self._spyre_device)
-        if self.speculative_config and self.speculative_config.use_dflash():
-            from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
-
-            assert isinstance(self.drafter, SpyreDFlashProposer)
-            move_model_to_spyre(self.drafter.model, self._spyre_device)
-            self.drafter.model.prepare_for_spyre()
+        if self._spec_method is not None:
+            self._spec_method.place_drafter(self)
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
         # falls back to the host elsewhere. FP32 linear heads stay on CPU.
@@ -709,60 +750,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
         )
 
-    def _input_fits_in_drafter(self, common_attn_metadata):
-        if self.speculative_config is not None and self.speculative_config.use_dflash():
-            # Commit each request's context, then decide which individual drafts fit.
-            return common_attn_metadata is not None
-        return super()._input_fits_in_drafter(common_attn_metadata)
+        if self._spec_method is not None:
+            self._spec_method.finish_drafter(self)
 
-    def propose_draft_token_ids(
-        self,
-        scheduler_output,
-        sampled_token_ids,
-        sampling_metadata,
-        hidden_states,
-        sample_hidden_states,
-        aux_hidden_states,
-        spec_decode_metadata,
-        common_attn_metadata,
-        slot_mappings,
-    ):
-        assert self.speculative_config is not None
-        if self.speculative_config.use_dflash():
-            # Greedy proposals use the rejection sampler's point-mass distribution,
-            # including when the target uses stochastic sampling.
-            self._draft_probs = None
-            self._draft_prob_req_ids = None
-            # CPU bookkeeping has already appended this step's sampled tokens.
-            at_output_limit = []
-            for request_id in self.input_batch.req_ids:
-                request = self.requests[request_id]
-                params = request.sampling_params
-                assert params is not None
-                at_output_limit.append(
-                    params.max_tokens is not None
-                    and len(request.output_token_ids) >= params.max_tokens
-                )
-            return cast("SpyreDFlashProposer", self.drafter).propose_spyre(
-                sampled_token_ids,
-                aux_hidden_states,
-                self._get_positions(scheduler_output.total_num_scheduled_tokens),
-                spec_decode_metadata,
-                common_attn_metadata,
-                skip_proposal=at_output_limit,
-                max_model_len=self.effective_drafter_max_model_len,
-            )
-        return super().propose_draft_token_ids(
-            scheduler_output,
-            sampled_token_ids,
-            sampling_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            spec_decode_metadata,
-            common_attn_metadata,
-            slot_mappings,
-        )
+    def _input_fits_in_drafter(self, common_attn_metadata):
+        # Looked up only when called: a method that never defers to upstream needs no MRO.
+        def upstream(metadata):
+            return super(TorchSpyreModelRunner, self)._input_fits_in_drafter(metadata)
+
+        if self._spec_method is None:
+            return upstream(common_attn_metadata)
+        return self._spec_method.input_fits_in_drafter(self, upstream, common_attn_metadata)
+
+    def propose_draft_token_ids(self, *args):
+        assert self._spec_method is not None
+
+        def upstream(*upstream_args):
+            return super(TorchSpyreModelRunner, self).propose_draft_token_ids(*upstream_args)
+
+        return self._spec_method.propose(self, upstream, *args)
 
     # TEMPORARY port of vllm#62688 (#1420): upstream rewinds discarded prefill samples
     # with set_offset, which CPU generators lack. Delete once the vLLM pin includes it.
@@ -1076,7 +1082,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        # Only a drafter with KV layers of its own reports their causality; model-free
+        # proposers have none, and gemma-4 MTP's sit in the target's groups above.
+        if self._spec_method is not None and self._spec_method.records_draft_attention:
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(
@@ -1614,6 +1622,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._spyre_kv_caches = dict(kv_caches)
         return kv_caches
+
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
+        """Also register each KV-sharing layer in its group's per-layer spec dict.
+
+        With the hybrid manager disabled, layers of differing head shapes share one group
+        under a UniformTypeKVCacheSpecs, and ``initialize_attn_backend`` looks every group
+        member up in its per-layer dict. Upstream appends a sharing layer (an MTP drafter's)
+        to the group but not to that dict, so the lookup raises.
+        """
+        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        for group in kv_cache_config.kv_cache_groups:
+            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if per_layer is None:
+                continue
+            for layer_name, target in self.shared_kv_cache_layers.items():
+                if target in per_layer:
+                    per_layer.setdefault(layer_name, per_layer[target])
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

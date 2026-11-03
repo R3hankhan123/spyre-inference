@@ -18,7 +18,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
+from spyre_inference.v1.sample.sampling_kernels import draw_seeds, has_sampling_kernels
 
 
 def apply_top_k_top_p_sort_free(
@@ -49,14 +49,47 @@ def apply_top_k_top_p_sort_free(
     return logits.fill_(-float("inf")).scatter_(1, idx, vals)
 
 
+def _has_topk_topp_kernels() -> bool:
+    return has_sampling_kernels() and hasattr(torch.ops._spyre_C, "cpu_topk_topp_sampling")
+
+
+def apply_top_k_top_p_host(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """Top-k / top-p on the host without a full-vocab sort.
+
+    Uses the vendored C++ kernels (csrc/cpu/topk_topp_sampler.cpp) on float32 logits,
+    masking in place. Without them: the sort-free path when both are set, else
+    upstream's host-sync path. Upstream's dispatcher only takes the latter on its own
+    CPU platform, so on Spyre it would sort the vocabulary of every row.
+
+    A k outside ``(0, vocab)`` leaves that row's top-k off."""
+    if k is None and p is None:
+        return logits
+    if logits.dtype == torch.float32 and _has_topk_topp_kernels():
+        logits = logits.contiguous()
+        ops = torch.ops._spyre_C
+        if p is None:
+            assert k is not None
+            ops.cpu_topk_sampling(logits, k.to(torch.int32))
+        elif k is None:
+            ops.cpu_topp_sampling(logits, p.float())
+        else:
+            ops.cpu_topk_topp_sampling(logits, k.to(torch.int32), p.float())
+        return logits
+    if k is not None and p is not None:
+        return apply_top_k_top_p_sort_free(logits, k, p)
+    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+
+
 class SpyreTopKTopPSampler(TopKTopPSampler):
-    """Sort-free top-k plus a fused Gumbel-max draw for random sampling.
+    """Host top-k / top-p plus a fused Gumbel-max draw for random sampling.
 
     Upstream only takes the sort-free top-k path under ``allow_cpu_sync`` (CPU
     platform only); Spyre D2Hs logits before sampling, so that host-device sync
-    is free and the full-vocab sort it otherwise runs is pure waste. Top-p
-    combined with top-k skips the sort too (``apply_top_k_top_p_sort_free``);
-    top-p alone sorts.
+    is free and the full-vocab sort it otherwise runs is pure waste. Top-k and
+    top-p run in the vendored C++ kernels (``apply_top_k_top_p_host``), with the
+    sort-free PyTorch path as the fallback.
 
     The draw runs in a fused Gumbel-max kernel that hashes its noise per element
     from a per-row seed rather than materializing a ``[B, V]`` noise tensor.
@@ -76,10 +109,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.32.0) with two
         # Spyre changes: sort-free top-k (and top-k + top-p) and a log-space
         # Gumbel draw. Re-sync with upstream on a vLLM bump.
-        if k is not None and p is not None:
-            logits = apply_top_k_top_p_sort_free(logits, k, p)
-        else:
-            logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+        logits = apply_top_k_top_p_host(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -88,13 +118,10 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         if not self.use_fp64_gumbel and has_sampling_kernels():
             # Per-row seeds key the kernel's noise, so the draw is one pass with
             # no noise tensor; seeded requests stay reproducible.
-            seeds = torch.randint(0, 2**62, (logits.shape[0],), dtype=torch.long)
-            for i, generator in generators.items():
-                seeds[i] = torch.randint(0, 2**62, (1,), generator=generator)
             return (
                 torch.ops._spyre_C.fused_gumbel_argmax(
                     logits.float(),  # ty: ignore[invalid-argument-type]
-                    seeds,  # ty: ignore[invalid-argument-type]
+                    draw_seeds(logits.shape[0], generators),  # ty: ignore[invalid-argument-type]
                 ),
                 logits_to_return,
             )
