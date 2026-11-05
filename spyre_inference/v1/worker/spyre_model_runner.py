@@ -64,6 +64,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.fp8_linear_kernel import install_fp8_act_quant_fusion
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
@@ -682,6 +683,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
         resolve_kv_scales(self.model, self.compilation_config.static_forward_context)
+
+        install_fp8_act_quant_fusion(self.model)
 
         move_model_to_spyre(self.model, self._spyre_device)
         if self.speculative_config and self.speculative_config.use_dflash():

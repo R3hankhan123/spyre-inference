@@ -22,6 +22,9 @@ its own graph outside one, since ``spyre.scaled_mm`` has no eager kernel:
     scale_a = quantscalepertokenfp8(x)              # in-graph, per-token
     y = scaled_mm(qfp8ch(x), qfp8wt) * (scale_a * scale_b)
 
+An MLP's activation does the quantizing itself: ``SpyreFp8ActQuantFusion`` writes FP8 into
+``down_proj``, which consumes it as a ``QuantizedActivation``.
+
 Per-tensor activations use the checkpoint's static ``input_scale``, or else compute
 ``scale_a = amax(x) / FP8_E4M3FN_MAX``, because ``quantscalepertokenfp8`` always
 reduces over the hidden dim.
@@ -44,7 +47,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
 )
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.platforms import PlatformEnum
 
 from .lazy_compile import CompileOutermost, maybe_compile
@@ -184,22 +190,10 @@ class SpyreFp8LinearKernel(CompileOutermost, FP8ScaledMMLinearKernel):
                 input_scale.detach().max().to(torch.float16).reshape(1), requires_grad=False
             )
 
-    @maybe_compile(force=True)
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor | QuantizedActivation,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # input_quant_key() is None, so fusion never hands over a QuantizedActivation.
-        if not isinstance(x, torch.Tensor):
-            raise TypeError(
-                f"SpyreFp8LinearKernel quantizes in-graph and cannot consume {type(x).__name__}."
-            )
-        orig_shape = x.shape
-        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-        weight = cast(torch.Tensor, layer.weight)
-        weight_scale = cast(torch.Tensor, layer.weight_scale)
+    def quantize_activation(
+        self, layer: torch.nn.Module, x2d: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The FP8 ``[M, K]`` activation and its scale, for ``layer``'s activation scheme."""
         if self._per_token_act:
             scale_a = torch.ops.spyre.quantscalepertokenfp8(
                 x2d,  # ty: ignore[invalid-argument-type]
@@ -213,6 +207,26 @@ class SpyreFp8LinearKernel(CompileOutermost, FP8ScaledMMLinearKernel):
             x2d,  # ty: ignore[invalid-argument-type]
             scale_a,  # ty: ignore[invalid-argument-type]
         )
+        return x_fp8, scale_a
+
+    @maybe_compile(force=True)
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | QuantizedActivation,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = cast(torch.Tensor, layer.weight)
+        weight_scale = cast(torch.Tensor, layer.weight_scale)
+        qa = as_quantized_activation(x, self.config.activation_quant_key)
+        if qa is None:
+            orig_shape = cast(torch.Tensor, x).shape
+            x2d = cast(torch.Tensor, x)
+            x2d = x2d.reshape(-1, x2d.shape[-1]) if x2d.dim() > 2 else x2d
+            x_fp8, scale_a = self.quantize_activation(layer, x2d)
+        else:
+            orig_shape = qa.orig_shape
+            x_fp8, scale_a = qa.data, qa.scale
         y = torch.ops.spyre.scaled_mm(
             x_fp8,
             weight,  # ty: ignore[invalid-argument-type]
@@ -221,7 +235,7 @@ class SpyreFp8LinearKernel(CompileOutermost, FP8ScaledMMLinearKernel):
             out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
         )
         out = _fp8_gemm_epilogue(y, scale_a, weight_scale, bias)
-        if x.dim() > 2:
+        if len(orig_shape) > 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
         return out
 
@@ -244,6 +258,76 @@ class SpyreFp8LinearKernel(CompileOutermost, FP8ScaledMMLinearKernel):
             "SpyreFp8LinearKernel runs only through apply_weights "
             "(qfp8ch + DMA'd qfp8wt). apply_scaled_mm is unused."
         )
+
+
+def _spyre_fp8_kernel(module: torch.nn.Module) -> SpyreFp8LinearKernel | None:
+    quant_method = getattr(module, "quant_method", None)
+    for owner in (quant_method, getattr(module, "scheme", None)):
+        kernel = getattr(owner, "fp8_linear", None)
+        if isinstance(kernel, SpyreFp8LinearKernel):
+            return kernel
+    return None
+
+
+class SpyreFp8ActQuantFusion(torch.nn.Module):
+    """An MLP's ``act_fn`` that writes the FP8 activation its ``down_proj`` would compute.
+
+    Replaces the attribute rather than hooking vLLM's ``maybe_fused_act_quant``, which
+    GraniteMLP and MistralMLP do not call, and whose producers are C kernels this build
+    lacks. For the same reason the kernel's ``input_quant_key()`` stays None.
+    """
+
+    def __init__(
+        self, act_fn: torch.nn.Module, kernel: SpyreFp8LinearKernel, linear: torch.nn.Module
+    ) -> None:
+        super().__init__()
+        self.act_fn = act_fn
+        self.kernel = kernel
+        # Not a submodule: the MLP owns the linear, so its parameters keep their one name.
+        object.__setattr__(self, "linear", linear)
+
+    def forward(self, x: torch.Tensor) -> QuantizedActivation:
+        # Named `x` as apply_weights names it: FX nodes take their names from locals, and
+        # Inductor's layout planning orders buffers by name, so another name can compile
+        # the same ops to a different plan.
+        x = self.act_fn(x)
+        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        data, scale = self.kernel.quantize_activation(self.linear, x2d)
+        return QuantizedActivation(
+            data=data,
+            scale=scale,
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=self.kernel.config.activation_quant_key,
+        )
+
+
+def install_fp8_act_quant_fusion(model: torch.nn.Module) -> int:
+    """Fuse SiLU×mul with ``down_proj``'s input quantization in every FP8 MLP.
+
+    Compiled runs only: outside a block graph ``apply_weights`` is its own compile, which
+    would take the ``QuantizedActivation`` as an argument. Returns the number of MLPs fused.
+    """
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    fused = 0
+    for module in list(model.modules()):
+        act_fn = getattr(module, "act_fn", None)
+        linear = getattr(module, "down_proj", None)
+        if not isinstance(act_fn, SiluAndMul) or linear is None:
+            continue
+        kernel = _spyre_fp8_kernel(linear)
+        if (
+            kernel is None
+            or not kernel.spyre_compile_enabled
+            or getattr(linear, "requires_unquantized_input", False)
+        ):
+            continue
+        module.act_fn = SpyreFp8ActQuantFusion(act_fn, kernel, linear)
+        fused += 1
+    if fused:
+        logger.info("Fused SiLU×mul with FP8 input quantization in %d MLPs", fused)
+    return fused
 
 
 def register_spyre_fp8_linear_kernel() -> None:

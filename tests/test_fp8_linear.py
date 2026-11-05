@@ -25,12 +25,15 @@ import warnings
 import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from torch._dynamo import lookup_backend
 
 from spyre_inference.custom_ops import fp8_linear_kernel
 from spyre_inference.custom_ops.fp8_linear_kernel import (
     FP8_E4M3FN_MAX,
+    SpyreFp8ActQuantFusion,
     SpyreFp8LinearKernel,
     _fp8_gemm_epilogue,
+    install_fp8_act_quant_fusion,
     register_spyre_fp8_linear_kernel,
 )
 
@@ -630,6 +633,44 @@ class TestSpyreFp8LinearKernel:
         max_diff = (actual.float() - expected.float()).abs().max().item()
         assert max_diff < 0.1, f"static input_scale max_diff={max_diff:.6f}"
 
+    def test_fused_activation_matches_the_unfused_path(self):
+        """``down_proj`` given the fused FP8 activation produces the same output as when it
+        quantizes for itself, and consumes it without quantizing a second time."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=True)
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(4)
+        weight_kn = torch.randn(128, 128, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=True)
+        x = torch.randn(4, 128, dtype=torch.float16, device="spyre")
+        unfused = self._run_spyre_apply(kernel, layer, x).cpu()
+
+        fusion = SpyreFp8ActQuantFusion(torch.nn.Identity(), kernel, layer)
+        graphs = []
+
+        def backend(gm, inputs):
+            graphs.append(
+                [(n.name, n.op, getattr(n.target, "__name__", n.target)) for n in gm.graph.nodes]
+            )
+            return lookup_backend("inductor")(gm, inputs)
+
+        def compile_with(fn):
+            return torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+
+        fused = compile_with(lambda inp: kernel.apply_weights(layer, fusion(inp)))(x).cpu()
+        torch.testing.assert_close(fused, unfused, atol=0.0, rtol=0.0)
+        compile_with(lambda inp: kernel.apply_weights(layer, inp))(x)
+        # Names too, as Inductor's layout planning orders buffers by them.
+        assert graphs[0] == graphs[1]
+
     def _assert_installed_matches_in_graph(
         self, kernel, layer, x, weight_fp16, *, num_tokens: int
     ) -> None:
@@ -683,6 +724,100 @@ def test_process_weights_folds_static_input_scale(monkeypatch):
     kernel.process_weights_after_loading(layer)
     assert layer.input_scale.dtype == torch.float16
     assert layer.input_scale.tolist() == [2.0]
+
+
+class _FakeMLP(torch.nn.Module):
+    def __init__(self, act_fn: torch.nn.Module, down_proj: torch.nn.Module) -> None:
+        super().__init__()
+        self.act_fn = act_fn
+        self.down_proj = down_proj
+
+
+def _fp8_mlp(kernel, *, scheme: bool = False):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    down_proj = torch.nn.Linear(4, 4)
+    owner = SimpleNamespace(fp8_linear=kernel)
+    if scheme:
+        down_proj.scheme = owner
+    else:
+        down_proj.quant_method = owner
+    return _FakeMLP(SiluAndMul(), down_proj)
+
+
+@pytest.mark.parametrize("scheme", [False, True], ids=["fp8-config", "compressed-tensors"])
+def test_fusion_replaces_the_fp8_mlp_activation(scheme):
+    """Both ways vLLM holds the kernel; the linear stays one module with one parameter name."""
+    if SpyreFp8LinearKernel is None:
+        pytest.skip("vLLM FP8 kernel base unavailable")
+    register_spyre_fp8_linear_kernel()
+    try:
+        kernel = _make_kernel(granite_channel=True)
+    except ImportError:
+        pytest.skip("vLLM FP8 APIs unavailable")
+    kernel.spyre_compile_enabled = True
+    mlp = _fp8_mlp(kernel, scheme=scheme)
+    names = [name for name, _ in mlp.named_parameters()]
+
+    assert install_fp8_act_quant_fusion(mlp) == 1
+    assert isinstance(mlp.act_fn, SpyreFp8ActQuantFusion)
+    assert mlp.act_fn.linear is mlp.down_proj
+    assert [name for name, _ in mlp.named_parameters()] == names
+    assert sum(m is mlp.down_proj for m in mlp.modules()) == 1
+    # Idempotent: a reload or a second pass does not wrap it again.
+    assert install_fp8_act_quant_fusion(mlp) == 0
+    # vLLM's own producers call C kernels this build lacks, so the key stays hidden.
+    assert kernel.input_quant_key() is None
+
+
+@pytest.mark.parametrize("case", ["eager", "not-fp8", "unquantized-input"])
+def test_fusion_leaves_other_mlps_alone(case):
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    if SpyreFp8LinearKernel is None:
+        pytest.skip("vLLM FP8 kernel base unavailable")
+    register_spyre_fp8_linear_kernel()
+    try:
+        kernel = _make_kernel(granite_channel=True)
+    except ImportError:
+        pytest.skip("vLLM FP8 APIs unavailable")
+    kernel.spyre_compile_enabled = case != "eager"
+    mlp = _fp8_mlp(kernel)
+    if case == "not-fp8":
+        del mlp.down_proj.quant_method
+    elif case == "unquantized-input":
+        mlp.down_proj.requires_unquantized_input = True
+
+    assert install_fp8_act_quant_fusion(mlp) == 0
+    assert isinstance(mlp.act_fn, SiluAndMul)
+
+
+def test_fused_activation_carries_the_kernels_key_and_shape(monkeypatch):
+    """A 3-D activation is flattened to quantize, and its shape travels with it."""
+    if SpyreFp8LinearKernel is None:
+        pytest.skip("vLLM FP8 kernel base unavailable")
+    register_spyre_fp8_linear_kernel()
+    try:
+        kernel = _make_kernel(granite_channel=True)
+    except ImportError:
+        pytest.skip("vLLM FP8 APIs unavailable")
+    seen = []
+
+    def quantize(layer, x2d):
+        seen.append((layer, x2d.shape))
+        return x2d, torch.ones(x2d.shape[0], 1)
+
+    monkeypatch.setattr(kernel, "quantize_activation", quantize)
+    linear = torch.nn.Linear(4, 4)
+    fusion = SpyreFp8ActQuantFusion(torch.nn.Identity(), kernel, linear)
+    qa = fusion(torch.zeros(2, 3, 128, dtype=torch.float16))
+
+    assert seen == [(linear, torch.Size([6, 128]))]
+    assert qa.orig_shape == (2, 3, 128)
+    assert qa.orig_dtype == torch.float16
+    assert qa.quant_key == kernel.config.activation_quant_key
 
 
 def test_process_weights_rejects_fp16():
