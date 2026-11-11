@@ -28,7 +28,18 @@ Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_pv, fp8_qk_page, fp8_quantize_q
 from spyre_inference.v1.attention.ops.sinks import normalize
+
+
+def _pv(probs, v_page, entries, num_kv_heads, num_queries_per_kv, block_size, fp8_math):
+    """``probs`` [J, B, KV, Q, block_size] @ ``v_page`` [E, KV, block_size, D] -> [J, B, KV,
+    Q, D]. fp8_pv takes P unmerged: its row scale over the merged view does not lower."""
+    rows = (entries, num_kv_heads, num_queries_per_kv, block_size)
+    if fp8_math:
+        return fp8_pv(probs, v_page, rows)
+    out = torch.matmul(probs.reshape(rows), v_page)
+    return out.reshape(*probs.shape[:-1], out.shape[-1])
 
 
 def _entry_local_update(
@@ -42,13 +53,12 @@ def _entry_local_update(
     num_queries_per_kv,
     block_size,
     head_size,
+    fp8_math=False,
 ):
     """Update each slot's maximum, unnormalized sum and weighted-value sum."""
 
     def pv(probs):
-        return torch.matmul(
-            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size), v_page
-        ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size)
+        return _pv(probs, v_page, entries, num_kv_heads, num_queries_per_kv, block_size, fp8_math)
 
     # A slot can be masked in every chunk. A finite sentinel avoids -inf - -inf;
     # its weight vanishes at the final merge against a slot with valid scores.
@@ -109,6 +119,7 @@ def batched_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    fp8_math=False,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -123,7 +134,8 @@ def batched_decode_kernel(
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
-    num_queries_per_kv, 1] per-head sink logits, or None.
+    num_queries_per_kv, 1] per-head sink logits, or None. fp8_math runs Q·Kᵀ and P·V on
+    batchmatmulfp8.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -134,22 +146,21 @@ def batched_decode_kernel(
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size
     )
+    # Quantized once: see fp8_quantize_q.
+    fp8_q = fp8_quantize_q(q, scale) if fp8_math else ()
 
     def reduce_chunk(probs, v_page):
         """Sum the chunk's blocks; its slots share one max, so this needs no rescale."""
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
-            torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
-                v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            _pv(probs, v_page, entries, num_kv_heads, num_queries_per_kv, block_size, fp8_math),
             dim=0,
             keepdim=True,
         )
         return chunk_sum, chunk_out
 
     def chunk_body(carry, tiles):
-        page_ids, mask_rows, k_pages, v_pages, q = tiles
+        page_ids, mask_rows, k_pages, v_pages, q, *fp8_q = tiles
         # Consume the chunk axis -> [E, 1] pages the gather splits on.
         page_ids = page_ids[0]
         mask_rows = mask_rows.reshape(blocks_per_chunk, num_seqs, *mask_rows.shape[3:])
@@ -161,7 +172,10 @@ def batched_decode_kernel(
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        if fp8_math:
+            scores = fp8_qk_page(*fp8_q, k_page, q.dtype)
+        else:
+            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
@@ -185,6 +199,7 @@ def batched_decode_kernel(
                     num_queries_per_kv,
                     block_size,
                     head_size,
+                    fp8_math,
                 ),
                 None,
             )
@@ -214,8 +229,8 @@ def batched_decode_kernel(
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     carry, _ = for_each_tile(
         chunk_body,
-        (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
-        dims=(0, 0, None, None, None),
+        (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q, *fp8_q),
+        dims=(0, 0, None, None, None, *(None for _ in fp8_q)),
         tile_size=1,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),

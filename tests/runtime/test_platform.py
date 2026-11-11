@@ -1206,3 +1206,24 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
     with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
         TorchSpyrePlatform.validate_request(_image_input(256, 281, modality=modality), None)
     assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)
+
+
+@pytest.mark.parametrize(
+    "quantization, requested, expected",
+    [
+        ("fp8", "auto", "fp8"),  # an FP8 model gets FP8 attention
+        (None, "auto", "auto"),  # an unquantized one keeps the model dtype
+        ("fp8", "fp8_e4m3", "fp8_e4m3"),  # an explicit choice is kept
+        ("fp8", "float16", "float16"),  # including opting out of FP8 attention
+    ],
+)
+def test_fp8_model_defaults_to_fp8_kv_cache(quantization, requested, expected):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.model_config.quantization = quantization
+    vllm_config.cache_config.cache_dtype = requested
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.cache_dtype == expected

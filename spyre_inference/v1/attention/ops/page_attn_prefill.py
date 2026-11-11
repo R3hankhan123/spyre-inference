@@ -22,6 +22,7 @@ every query row, so this kernel spends it instead: batched GQA over
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_pv, fp8_qk_page, fp8_quantize_q
 from spyre_inference.v1.attention.ops.sinks import normalize
 
 
@@ -44,6 +45,7 @@ def page_attn_prefill_kernel(
     v_scale=None,
     sinks=None,
     page_group=1,
+    fp8_math=False,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
@@ -56,6 +58,7 @@ def page_attn_prefill_kernel(
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
         page_group: pages per online-softmax update; must divide num_blocks.
+        fp8_math: run Q·Kᵀ and P·V on batchmatmulfp8; a float8 cache only.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -83,12 +86,34 @@ def page_attn_prefill_kernel(
     # stacked on dim 0.
     operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
     dims: tuple[int | None, ...] = (0, None, None, 0, None)
+    if fp8_math:
+        # A page's query-group axis is a broadcast 1 and scaled_bmm needs equal batch dims,
+        # so the groups fold into the rows rather than copying the page per group; the
+        # rows then expand over the page group. Quantized once: see fp8_quantize_q.
+        rows = q.reshape(*q.shape[:-3], num_queries_per_kv * padded_query_len, head_size)
+        q8, q_mult = fp8_quantize_q(rows, scale)
+        batch = (page_group, num_kv_heads) if grouped else (num_kv_heads,)
+        operands += (q8.expand(*batch, *q8.shape[-2:]), q_mult.expand(*batch, *q_mult.shape[-2:]))
+        dims += (None, None)
 
     def fold_group(tile, reduce):
         return reduce(tile, dim=0, keepdim=True) if grouped else tile
 
+    def qk(q, k_page, fp8_q):
+        if not fp8_math:
+            return torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        k_page = k_page.squeeze(-3)
+        scores = fp8_qk_page(*fp8_q, k_page, q.dtype)
+        return scores.reshape(*k_page.shape[:-2], *q.shape[-3:-1], -1)
+
+    def pv(probs, v_page):
+        if not fp8_math:
+            return torch.matmul(probs, v_page)
+        rows = (*probs.shape[:-3], probs.shape[-3] * probs.shape[-2], probs.shape[-1])
+        return fp8_pv(probs, v_page.squeeze(-3), rows)
+
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q = tiles
+        page_index, k_pages, v_pages, mask_tile, q, *fp8_q = tiles
 
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which round-trips the index through the host
@@ -109,7 +134,7 @@ def page_attn_prefill_kernel(
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        scores = qk(q, k_page, fp8_q)
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
@@ -124,7 +149,7 @@ def page_attn_prefill_kernel(
         new_max = torch.maximum(tile_max, scores_max)
         tile_probs = torch.exp(scores - new_max)
         new_sum = tile_sum * rescale + fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum)
-        new_output = tile_output * rescale + fold_group(torch.matmul(tile_probs, v_page), torch.sum)
+        new_output = tile_output * rescale + fold_group(pv(tile_probs, v_page), torch.sum)
         return (new_max, new_sum, new_output), None
 
     group_axis = (1,) if grouped else ()

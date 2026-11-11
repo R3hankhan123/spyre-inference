@@ -1478,8 +1478,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache.
 
     Pages are read by indirect access, indexing the dense tensor with a device-resident
-    page index. A float8 cache stores ``K / k_scale`` and ``V / v_scale``, dequantized on
-    read.
+    page index. A float8 cache stores ``K / k_scale`` and ``V / v_scale``, and attention
+    over it runs Q·Kᵀ on FP8 tensors (see ``custom_ops/fp8_matmul.py``).
 
     The KV store and the attention kernels are always compiled, under --enforce-eager
     too: the page gather is a 2-D subscript, and eager aten.index takes only a single
@@ -1560,6 +1560,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # At construction: forward() runs past a custom-op boundary that loses the config.
         self.block_size: int = get_current_vllm_config().cache_config.block_size
+        # FP8 Q·Kᵀ writes block_size columns from a QFP8WT page, which must fill float8
+        # sticks; a 64-wide page lowers to garbage, so such a cache computes in fp16.
+        self.fp8_math = self.kv_cache_fp8 and self.block_size % 128 == 0
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
@@ -2293,6 +2296,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             logits_soft_cap=self.logits_soft_cap,
             out=out,
             v_scale=v_scale,
+            fp8_math=self.fp8_math,
             sinks=self._device_sinks(query_dev.device),
         )
 
@@ -2364,6 +2368,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 logits_soft_cap=self.logits_soft_cap,
                 out=out,
                 v_scale=v_scale,
+                fp8_math=self.fp8_math,
                 sinks=self._device_sinks(query.device),
                 page_group=_prefill_page_group_for_range(page_range, self.num_heads, self.head_size)
                 if page_range is not None
@@ -2394,6 +2399,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             logits_soft_cap=self.logits_soft_cap,
             out=out,
             v_scale=v_scale,
+            fp8_math=self.fp8_math,
             sinks=self._device_sinks(query.device),
         )
 

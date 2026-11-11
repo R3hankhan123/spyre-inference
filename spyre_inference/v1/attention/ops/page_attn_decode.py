@@ -24,6 +24,7 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_pv, fp8_qk_page, fp8_quantize_q
 from spyre_inference.v1.attention.ops.sinks import normalize
 
 
@@ -47,6 +48,7 @@ def page_attn_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    fp8_math=False,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -71,6 +73,7 @@ def page_attn_decode_kernel(
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
+        fp8_math: run Q·Kᵀ and P·V on batchmatmulfp8; a float8 cache only.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
@@ -80,9 +83,11 @@ def page_attn_decode_kernel(
     num_queries_per_kv = num_heads // num_kv_heads
 
     q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
+    # Quantized once: see fp8_quantize_q.
+    fp8_q = fp8_quantize_q(q, scale) if fp8_math else ()
 
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q, kv_row_pool = tiles
+        page_index, k_pages, v_pages, mask_tile, q, kv_row_pool, *fp8_q = tiles
         # A tile is readable whole or as the single element `page_index[0, 0:1]` is; a
         # [num_kv_heads]-wide read of a wider row is neither, so the rows come from the
         # pool. See the `kv_row_pool` docstring.
@@ -96,7 +101,10 @@ def page_attn_decode_kernel(
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
-        scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        if fp8_math:
+            scores = fp8_qk_page(*fp8_q, k_page, q.dtype)
+        else:
+            scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after
             # it would un-mask the padded lanes.
@@ -112,18 +120,27 @@ def page_attn_decode_kernel(
         rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
         probs = torch.exp(scores - new_max)
+        pv = fp8_pv(probs, v_page) if fp8_math else torch.matmul(probs, v_page)
         return (
             new_max,
             tile_sum * rescale + probs.sum(dim=-1, keepdim=True),
-            tile_output * rescale + torch.matmul(probs, v_page),
+            tile_output * rescale + pv,
         ), None
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     (tile_max, tile_sum, tile_output), _ = for_each_tile(
         block_body,
-        (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q, kv_row_pool),
-        dims=(0, None, None, 0, None, None),
+        (
+            page_index_table[:num_blocks],
+            k_pages,
+            v_pages,
+            mask_stack[:num_blocks],
+            q,
+            kv_row_pool,
+            *fp8_q,
+        ),
+        dims=(0, None, None, 0, None, None, *(None for _ in fp8_q)),
         tile_size=1,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),

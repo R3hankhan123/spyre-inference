@@ -502,15 +502,32 @@ per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding a
 ### FP8 KV cache
 
 `--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the pages as `float8_e4m3fn`, halving KV
-memory and the bytes each page read moves.
+memory and the bytes each page read moves. An FP8 model gets this cache by default
+(`_maybe_default_fp8_kv_cache`) when the head size is a multiple of 128; an explicit
+`--kv-cache-dtype` wins.
 Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
 The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
 has no device lowering and falls back to CPU, which writes bytes in sequential order
 while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
-`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
-dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
-impl passes them. The attention math itself stays fp16.
+`head_major_kv_layout`. The three read kernels apply `v_scale` to the output; `k_scale`
+is folded into the softmax scale the impl passes them.
+
+Q·Kᵀ and P·V then run on FP8 tensors, through `spyre.scaled_bmm` (`batchmatmulfp8`,
+`custom_ops/fp8_matmul.py`), on the batch dims each kernel already holds; prefill and
+decode fold a KV head's query groups into the row axis, since a page is shared across them
+and `scaled_bmm` needs equal batch dims. Its second operand must be QFP8WT while a page is
+QFP8CH, so a gathered page is cast to fp16 and requantized with `qfp8wt` — lossless,
+because with `k_scale` folded out its values are exactly e4m3. Q and P are quantized per row to
+their own amax, so the fp16 product stays under 448 × head_size (57344 at 128); scaling Q
+to 448, as the FP8 linears do, overflows to inf. Scaling P per row also keeps a page whose
+scores sit far below the running max from flushing to zero in e4m3. The page's block_size columns must fill
+float8 sticks, so `fp8_math` is on only for a block size that is a multiple of 128 (the
+default); a 64-wide page lowers to garbage. Inside the page loop this needs
+torch-spyre#5907 or #6013.
+
+The kernels keep an `fp8_math=False` path that computes both matmuls in fp16, which the
+CPU tests compare against.
 
 The scales are per-tensor and per-layer, read from the layer's `_k_scale_float` /
 `_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) at model load and
