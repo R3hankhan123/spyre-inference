@@ -29,7 +29,7 @@ Only the temporary softmax state grows; the permanent KV cache is unchanged.
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
-from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
+from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
 def _entry_local_update(
@@ -121,11 +121,8 @@ def batched_decode_kernel(
     entry j*B+s selects block slot j for sequence s; rep_row_ids repeats the
     sequence's query in that same order.
 
-    Native metadata: page IDs [C*J, B], mask [C*J, B, H, 1, block_size].
-    Temporary split-index metadata: IDs [C, E, 1], mask [C, J, B, H, 1, block_size].
-    H is num_kv_heads for the tiled walk and 1 (broadcast) for the Python walk.
-    The split-index form is used only with for_each_tile; its explicit device
-    layout places each page ID in a separate stick so entries can split across cores.
+    Page IDs [C*J, B], mask [C*J, B, H, 1, block_size]. H is num_kv_heads for the
+    tiled walk and 1 (broadcast) for the Python walk.
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
@@ -133,11 +130,7 @@ def batched_decode_kernel(
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
-    # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
-    split_index = USE_FOR_EACH_TILE
-    num_chunks = (
-        chunk_page_ids.shape[0] if split_index else chunk_page_ids.shape[0] // blocks_per_chunk
-    )
+    num_chunks = chunk_page_ids.shape[0] // blocks_per_chunk
     # With one chunk there is no repeated cross-slot merge to defer.
     use_entry_local = num_chunks > 1
     q = query.index_select(0, rep_row_ids).reshape(
@@ -159,10 +152,6 @@ def batched_decode_kernel(
 
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
-        if split_index:
-            # Workaround walk: consume the chunk axis -> [E, 1] pages the gather splits on.
-            page_ids = page_ids[0]
-            mask_rows = mask_rows.reshape(blocks_per_chunk, num_seqs, *mask_rows.shape[3:])
         # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
         # whole 32-entry sticks, and flattening the int32 tile first needs an unsupported
         # staging layout. Costs the eager path, which the preconditions decline.
@@ -231,7 +220,7 @@ def batched_decode_kernel(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
-        tile_size=1 if split_index else blocks_per_chunk,
+        tile_size=blocks_per_chunk,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),

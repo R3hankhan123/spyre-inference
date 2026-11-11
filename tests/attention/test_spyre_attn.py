@@ -2100,10 +2100,7 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
 
 
 def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
-    from spyre_inference.v1.attention.ops import batched_decode
-
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
     num_seqs, bpc, num_chunks = 2, 2, 3
@@ -2738,10 +2735,7 @@ def test_multi_seq_decode_matches_fp32_reference(
     Card-free and fp32, so it pins the reduction, the read and the entry-major, kv-minor
     row order the mask is broadcast in, rather than the fp16 tolerances.
     """
-    from spyre_inference.v1.attention.ops import batched_decode
-
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
 
     torch.set_default_device("cpu")
     set_random_seed(0)

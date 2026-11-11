@@ -91,8 +91,6 @@ def _meta(b, bpc, kv, q):
 def python_walk(monkeypatch):
     # The body math is under test; drive the Python walk (carry=None).
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    # The kernel captures the walk mode separately at import time.
-    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", False)
 
 
 @pytest.mark.parametrize(("c", "kv", "q"), [(1, 1, 1), (2, 1, 1), (2, 2, 4)])
@@ -221,13 +219,12 @@ def test_body_matches_reference_with_init_state():
 
 
 @pytest.mark.parametrize("c", [1, 3])
-@pytest.mark.parametrize("split_index", [False, True])
-def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
+@pytest.mark.parametrize("per_head_mask", [False, True])
+def test_uploaded_metadata_matches_kernel(c, per_head_mask):
     """Feed the production upload's metadata to the whole kernel on CPU.
 
-    Only the device transfer is replaced. The Python walk emulates chunk
-    boundaries, including the split-index shape branch; this does not test
-    compiled for_each_tile execution or the device's physical index layout.
+    The upload is a plain ``convert`` to the CPU, and the kernel runs the Python walk;
+    this does not test compiled for_each_tile execution or the device's index layout.
     """
     from spyre_inference.v1.attention.backends import spyre_attn as backend
 
@@ -236,7 +233,7 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
     mask[0, 0, 0, 0, 2:] = float("-inf")
     mask[::bpc, 1] = float("-inf")
-    if split_index:
+    if per_head_mask:
         # The tiled walk's builder materializes the KV-head axis.
         mask = mask.expand(-1, -1, kv, -1, -1).contiguous()
     original_ids, original_mask = page_ids.clone(), mask.clone()
@@ -247,22 +244,8 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
         chunk_page_ids_cpu=page_ids,
         mask_by_chunk_cpu=mask,
     )
-    layouts = []
-    original_to = torch.Tensor.to
-
-    def cpu_transfer(tensor, *args, **kwargs):
-        if "device_layout" in kwargs:
-            layouts.append(kwargs.pop("device_layout"))
-        return original_to(tensor, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", split_index)
-    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
     impl = object.__new__(backend.SpyreAttentionImpl)
     impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
-    assert len(layouts) == int(split_index)
-    if split_index:
-        assert list(layouts[0].device_size) == [c, 1, bpc * b, 32]
     got = _call(
         query,
         metadata.rep_row_ids_dev,
@@ -283,14 +266,3 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     )
     assert torch.equal(metadata.chunk_page_ids_cpu, original_ids)
     assert torch.equal(metadata.mask_by_chunk_cpu, original_mask)
-
-
-def test_temp_split_layout_fields():
-    """The proven host [C, E, 1] / device [C, 1, E, 32] fields."""
-    from spyre_inference.v1.attention.ops.layout import (
-        temporary_chunk_major_page_index_layout,
-    )
-
-    layout = temporary_chunk_major_page_index_layout(3, 8)
-    assert list(layout.device_size) == [3, 1, 8, 32]
-    assert list(layout.stride_map) == [8, -1, 1, -1]
