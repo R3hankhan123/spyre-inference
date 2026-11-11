@@ -28,6 +28,7 @@ Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_qk
 from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
@@ -113,6 +114,7 @@ def batched_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    fp8_math=False,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -129,7 +131,8 @@ def batched_decode_kernel(
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
-    num_queries_per_kv, 1] per-head sink logits, or None.
+    num_queries_per_kv, 1] per-head sink logits, or None. fp8_math runs Q·Kᵀ on
+    batchmatmulfp8; P·V stays in the model dtype (see page_attn_decode).
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -171,7 +174,10 @@ def batched_decode_kernel(
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        if fp8_math:
+            scores = fp8_qk(q, k_page, scale)
+        else:
+            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.

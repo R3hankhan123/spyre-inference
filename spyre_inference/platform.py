@@ -525,6 +525,25 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def _maybe_default_fp8_kv_cache(cls, vllm_config: VllmConfig) -> None:
+        """Give an FP8 model an FP8 KV cache, so its attention runs on FP8 tensors.
+
+        Only where that cache is supported: a decoder whose head size fills float8 sticks
+        (128 elements). An explicit ``kv_cache_dtype`` is kept.
+        """
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        if (
+            model_config.quantization is None
+            or cache_config.cache_dtype != "auto"
+            or model_config.runner_type == "pooling"
+            or model_config.get_head_size() % 128
+        ):
+            return
+        cache_config.cache_dtype = "fp8"
+        logger.info("FP8 model: using an FP8 KV cache, so attention runs on FP8 tensors.")
+
+    @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a stick-aligned size when the native
         head_dim isn't one, stashing the original as ``_spyre_orig_head_dim``.
@@ -849,6 +868,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
             # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
             cls._maybe_pad_intermediate_size(vllm_config)
+
+            # After the head_dim pad, which the float8 head-size check reads.
+            cls._maybe_default_fp8_kv_cache(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 

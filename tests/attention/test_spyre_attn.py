@@ -373,19 +373,22 @@ def _run_spyre_attn_test(
         sinks=sinks,
     )
 
-    if tolerance is not None:
-        atol, rtol = tolerance
+    if fp8:
+        _assert_fp8_read(output.to("cpu"), ref_output, fp8_math=True)
     else:
-        atol, rtol = (0.3, 0.2) if max(query_lens) >= 32 else (0.2, 0.2)
-    assert_close_outliers(
-        output.to("cpu"),
-        ref_output,
-        max_outliers=5,
-        atol=atol,
-        rtol=rtol,
-        outlier_atol=atol * 2,
-        outlier_rtol=rtol * 2,
-    )
+        if tolerance is not None:
+            atol, rtol = tolerance
+        else:
+            atol, rtol = (0.3, 0.2) if max(query_lens) >= 32 else (0.2, 0.2)
+        assert_close_outliers(
+            output.to("cpu"),
+            ref_output,
+            max_outliers=5,
+            atol=atol,
+            rtol=rtol,
+            outlier_atol=atol * 2,
+            outlier_rtol=rtol * 2,
+        )
 
     # Release Spyre DMA mappings eagerly. Python doesn't free the KV-page tensors between
     # tests until GC runs, but the Spyre VFIO driver keeps DMA regions mapped until the
@@ -1793,6 +1796,21 @@ def test_fp8_kv_cache_dtype(default_vllm_config):
         )
 
 
+def test_fp8_math_needs_a_stick_wide_block(default_vllm_config, monkeypatch):
+    """FP8 Q·Kᵀ writes block_size columns from a QFP8WT page; a 64-wide page keeps the
+    float8 cache but computes in fp16."""
+    from vllm.config import get_current_vllm_config
+
+    cache_config = get_current_vllm_config().cache_config
+    for block_size, fp8_math in ((128, True), (256, True), (64, False), (192, False)):
+        monkeypatch.setattr(cache_config, "block_size", block_size)
+        impl = SpyreAttentionImpl(
+            num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+        )
+        assert impl.kv_cache_fp8
+        assert impl.fp8_math is fp8_math, block_size
+
+
 def test_encoder_layers_ignore_an_fp8_cache_dtype(default_vllm_config):
     """Upstream hands encoder layers the engine's cache dtype, but they keep no cache."""
     from vllm.v1.attention.backend import AttentionType
@@ -2063,7 +2081,22 @@ def test_prefill_page_group_keeps_the_group_as_a_batch_axis(monkeypatch):
     assert len(gathers) == 2 * (num_blocks // page_group) + 1
 
 
-def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
+_FP8_MATH_PARAMS = pytest.mark.parametrize("fp8_math", [False, True], ids=["dequant", "fp8_math"])
+
+
+def _assert_fp8_read(got, want, fp8_math):
+    if not fp8_math:
+        torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+        return
+    # FP8 math also rounds Q and P to e4m3 (2^-4 relative each), which these peaked
+    # scores turn into ~5% of the output; a wrong operand or scale is off by ~100%.
+    rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
+    assert rel < 0.1, f"fp8 math relative error {rel:.4f}"
+
+
+@_FP8_MATH_PARAMS
+@pytest.mark.parametrize("page_group", [1, 3])
+def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch, fp8_math, page_group):
     """A float8 cache read through the scales equals the model-dtype read of its values."""
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
@@ -2093,20 +2126,80 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     scale = head_size**-0.5
 
     got = page_attn_prefill_kernel(
-        **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
+        **common,
+        k_pages=k8,
+        v_pages=v8,
+        scale=scale * k_scale,
+        v_scale=v_scale,
+        page_group=page_group,
+        fp8_math=fp8_math,
     )
     want = page_attn_prefill_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
-    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+    _assert_fp8_read(got, want, fp8_math)
 
 
-def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
+@_FP8_MATH_PARAMS
+def test_fp8_decode_reads_match_the_dequantized_cache(monkeypatch, fp8_math):
+    """The single-sequence decode kernel, as the prefill test above."""
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    set_random_seed(0)
+    num_kv_heads, qpk, head_size, block_size, num_blocks, num_pages = 2, 4, 128, 64, 3, 6
+    num_heads = num_kv_heads * qpk
+    k_scale, v_scale = 0.05, 0.02
+    k8, v8, k_dq, v_dq = _fp8_pages(
+        num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale
+    )
+
+    def folded(pages):
+        return pages.reshape(num_pages * num_kv_heads, block_size, head_size)
+
+    index_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    index_table[:, 0] = torch.tensor([4, 1, 3])
+    mask = torch.zeros(num_blocks, 1, block_size, dtype=DTYPE)
+    mask[-1, :, 40:] = float("-inf")
+    common = dict(
+        query=torch.randn(1, num_heads, head_size).to(DTYPE),
+        query_row_index=torch.zeros(1, dtype=torch.int32),
+        page_index_table=index_table,
+        kv_row_pool=torch.arange(num_pages * num_kv_heads, dtype=torch.int32).reshape(
+            num_pages, num_kv_heads, 1
+        ),
+        mask_stack=mask,
+        num_blocks=num_blocks,
+        padded_query_len=1,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+    )
+    scale = head_size**-0.5
+
+    got = page_attn_decode_kernel(
+        **common,
+        k_pages=folded(k8),
+        v_pages=folded(v8),
+        scale=scale * k_scale,
+        v_scale=v_scale,
+        fp8_math=fp8_math,
+    )
+    want = page_attn_decode_kernel(
+        **common, k_pages=folded(k_dq), v_pages=folded(v_dq), scale=scale
+    )
+    _assert_fp8_read(got, want, fp8_math)
+
+
+# One chunk takes the chunk reduction, several the entry-local merge; each has its own
+# P @ V.
+@_FP8_MATH_PARAMS
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch, fp8_math, num_chunks):
     from spyre_inference.v1.attention.ops import batched_decode
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
-    num_seqs, bpc, num_chunks = 2, 2, 3
+    num_seqs, bpc = 2, 2
     k_scale, v_scale = 0.05, 0.02
     k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
 
@@ -2130,10 +2223,15 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
     )
 
     got = batched_decode_kernel(
-        **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
+        **common,
+        k_pages=k8,
+        v_pages=v8,
+        scale=scale * k_scale,
+        v_scale=v_scale,
+        fp8_math=fp8_math,
     )
     want = batched_decode_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
-    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+    _assert_fp8_read(got, want, fp8_math)
 
 
 _SLOT_CASES = [

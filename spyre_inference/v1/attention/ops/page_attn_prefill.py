@@ -22,6 +22,7 @@ every query row, so this kernel spends it instead: batched GQA over
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_qk
 from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
@@ -45,6 +46,7 @@ def page_attn_prefill_kernel(
     v_scale=None,
     sinks=None,
     page_group=1,
+    fp8_math=False,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
@@ -58,6 +60,8 @@ def page_attn_prefill_kernel(
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
         page_group: pages per online-softmax update; must divide num_blocks.
+        fp8_math: run Q·Kᵀ on batchmatmulfp8; a float8 cache only. P·V stays in the model
+        dtype: an FP8 bmm on P, computed in the page loop's body, fails deeptools scheduling.
     """
     if page_group < 1 or num_blocks % page_group:
         raise ValueError(
@@ -87,6 +91,17 @@ def page_attn_prefill_kernel(
     def fold_group(tile, reduce):
         return reduce(tile, dim=0, keepdim=True) if grouped else tile
 
+    # A page's query-group axis is a broadcast 1 and scaled_bmm needs equal batch dims, so
+    # FP8 math folds the groups into the rows rather than copying the page per group.
+    def qk(q, k_page):
+        if not fp8_math:
+            return torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        k_page = k_page.squeeze(-3)
+        rows = q.reshape(*q.shape[:-3], -1, head_size)
+        rows = rows.expand(*k_page.shape[:-2], *rows.shape[-2:])
+        scores = fp8_qk(rows, k_page, scale)
+        return scores.reshape(*k_page.shape[:-2], *q.shape[-3:-1], -1)
+
     def block_body(carry, tiles):
         page_index, k_pages, v_pages, mask_tile, q = tiles
 
@@ -109,7 +124,7 @@ def page_attn_prefill_kernel(
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        scores = qk(q, k_page)
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.

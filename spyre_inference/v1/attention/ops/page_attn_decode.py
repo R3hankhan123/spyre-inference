@@ -24,6 +24,7 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.custom_ops.fp8_matmul import fp8_qk
 from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
@@ -48,6 +49,7 @@ def page_attn_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    fp8_math=False,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -72,6 +74,8 @@ def page_attn_decode_kernel(
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
+        fp8_math: run Q·Kᵀ on batchmatmulfp8; a float8 cache only. P·V stays in the model
+        dtype: an FP8 bmm on P, computed in the page loop's body, fails deeptools scheduling.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
@@ -95,7 +99,10 @@ def page_attn_decode_kernel(
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
-        scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        if fp8_math:
+            scores = fp8_qk(q, k_page, scale)
+        else:
+            scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after
             # it would un-mask the padded lanes.
