@@ -1013,6 +1013,9 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
         _maybe_uniproc(parallel_config, requested_backend)
 
+        if vllm_config.lora_config is not None:
+            cls._configure_lora(vllm_config, runner)
+
         # Must run after super(), which sets a block_size default of its own.
         cls._align_block_size(vllm_config)
 
@@ -1028,6 +1031,24 @@ class TorchSpyrePlatform(CpuPlatform):
 
         if vllm_config.model_config is not None:
             cls._set_vision_token_limit(vllm_config)
+
+    @classmethod
+    def _configure_lora(cls, vllm_config: VllmConfig, runner: str) -> None:
+        from vllm.config import CompilationMode
+
+        if runner != "v2":
+            raise ValueError("LoRA on Spyre requires the V2 model runner (SPYRE_MODEL_RUNNER=v2).")
+        if vllm_config.lora_config.fully_sharded_loras:
+            raise ValueError("Spyre does not support fully_sharded_loras.")
+        # CpuPlatform runs any LoRA config eager; Spyre's LoRA layers trace into the block
+        # graph (spyre_inference/lora.py), so keep the compile apply_config_platform_defaults set.
+        model_config = vllm_config.model_config
+        if model_config is not None and not model_config.enforce_eager:
+            vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+
+    @classmethod
+    def get_punica_wrapper(cls) -> str:
+        return "spyre_inference.lora.SpyrePunicaWrapper"
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

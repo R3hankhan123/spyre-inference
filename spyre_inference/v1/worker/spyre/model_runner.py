@@ -61,6 +61,11 @@ class SpyreModelRunnerV2(GPUModelRunner):
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
 
+    def load_lora_model(self, model: Any, vllm_config: VllmConfig, device: torch.device) -> Any:
+        # load.py wraps the LoRA layers in the host model before the device move and the
+        # block compile; upstream's call after the loader would get the finished wrapper.
+        return model
+
     def get_model(self) -> nn.Module:
         model = unwrap_model(self.model)
         assert isinstance(model, nn.Module), type(model)

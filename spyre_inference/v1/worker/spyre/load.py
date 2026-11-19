@@ -38,7 +38,9 @@ from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
+from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
+from spyre_inference.lora import prepare_lora_for_spyre
 from spyre_inference.models import check_spyre_model
 from spyre_inference.moe import prepare_moe_layers_on_threads
 from spyre_inference.multimodal import apply_multimodal_patches
@@ -111,6 +113,11 @@ class _SpyreModelLoaderWrapper:
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
         resolve_kv_scales(model, vllm_config.compilation_config.static_forward_context)
+        if runner.lora_config:
+            # Upstream wraps LoRA after load_model returns, which here is the compiled
+            # wrapper; the layers have to be in the host model the blocks compile from.
+            model = LoRAModelRunnerMixin.load_lora_model(runner, model, vllm_config, runner.device)
+            prepare_lora_for_spyre(model, vllm_config, runner.spyre_device)
         move_model_to_spyre(model, runner.spyre_device)
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
@@ -243,8 +250,6 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
     """
     if kwargs.get("model") is not None:
         raise NotImplementedError("Loading a caller-built model is not supported on Spyre V2.")
-    if runner.lora_config:
-        raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
     if runner.parallel_config.enable_batch_sharded_sampling:
         # Upstream calls model.compute_logits_local, past the wrapper's H2D and row buckets.
         raise NotImplementedError("Batch-sharded sampling is not supported on the Spyre V2 runner.")

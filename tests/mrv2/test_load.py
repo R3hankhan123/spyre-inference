@@ -347,9 +347,7 @@ def test_a_failure_after_the_swaps_ran_adds_no_note(stub_targets) -> None:
     assert not getattr(info.value, "__notes__", None)
 
 
-def test_load_refuses_lora_batch_sharding_and_caller_built_models() -> None:
-    with pytest.raises(NotImplementedError, match="LoRA"):
-        load.load_and_wrap(_runner(lora_config=object()))
+def test_load_refuses_batch_sharding_and_caller_built_models() -> None:
     with pytest.raises(NotImplementedError, match="Batch-sharded sampling"):
         load.load_and_wrap(
             _runner(parallel_config=SimpleNamespace(enable_batch_sharded_sampling=True))
@@ -478,4 +476,86 @@ def test_load_model_through_upstreams_body() -> None:
         "TASKS": "('generate',)",
         "STOCK_COMPILES": "0",
         "MEMORY": "0",
+    }, result.stdout[-3000:]
+
+
+@pytest.mark.subprocess_isolated
+def test_load_model_with_lora_wraps_spyre_layers_before_compile() -> None:
+    """LoRA through a real SpyreModelRunnerV2: the layers are wrapped in the host model
+    the blocks compile from, the run stays compiled, and an adapter set on the packed QKV
+    layer adds the per-token delta upstream's punica semantics define."""
+    script = textwrap.dedent("""
+        import torch
+        from vllm.config import (
+            CacheConfig, CompilationConfig, CompilationMode, LoadConfig, LoRAConfig,
+            ModelConfig, VllmConfig, set_current_vllm_config,
+        )
+        from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+        from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping
+
+        from spyre_inference.lora import SpyreLinearLoRAMixin
+        from spyre_inference.v1.worker.spyre import device_shims, load
+        from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+
+        compiled = []
+        load.compile_for_spyre = lambda model, config: (compiled.append(model) or model, 0)
+        device_shims.install()
+        config = VllmConfig(
+            model_config=ModelConfig(
+                model="ibm-ai-platform/micro-g3.3-8b-instruct-1b", max_model_len=256,
+            ),
+            cache_config=CacheConfig(block_size=64),
+            load_config=LoadConfig(load_format="dummy"),
+            compilation_config=CompilationConfig(mode=CompilationMode.STOCK_TORCH_COMPILE),
+            lora_config=LoRAConfig(max_loras=2, max_lora_rank=8),
+        )
+        with set_current_vllm_config(config):
+            init_distributed_environment(1, 0, "file://{store}", 0, "gloo")
+            ensure_model_parallel_initialized(1, 1)
+            runner = SpyreModelRunnerV2(config, torch.device("cpu"))
+            runner.load_model()
+            model = runner.get_model()
+            lora_layers = [m for m in model.modules() if isinstance(m, BaseLayerWithLoRA)]
+            print("MODE", config.compilation_config.mode.name)
+            print("COMPILED_HOLDS_LORA", any(
+                isinstance(m, BaseLayerWithLoRA) for m in compiled[0].modules()
+            ))
+            print("ALL_SPYRE", bool(lora_layers) and all(
+                isinstance(m, SpyreLinearLoRAMixin) for m in lora_layers
+            ))
+
+            qkv = next(m for m in lora_layers if len(m.lora_a_stacked) == 3)
+            gen = torch.Generator().manual_seed(0)
+            a = [torch.randn(8, qkv.input_size, generator=gen).half() for _ in range(3)]
+            b = [torch.randn(n, 8, generator=gen).half() * 0.1 for n in qkv.output_slices]
+            qkv.set_lora(1, a, b)
+            # Token 0 uses the adapter in slot 1 (id 7), token 1 none, rows 2-3 are padding.
+            mapping = LoRAMapping((7, 0), (7, 0), is_prefill=True)
+            qkv.punica_wrapper.update_metadata(mapping, [None, 7], 3, 32)
+            x = torch.randn(4, qkv.input_size, generator=gen).half()
+            first = lambda out: out[0] if isinstance(out, tuple) else out
+            got = first(qkv(x)).float()
+            base = first(qkv.base_layer(x)).float()
+            delta = torch.cat([x[0].float() @ ai.float().T @ bi.float().T for ai, bi in zip(a, b)])
+            print("LORA_TOKEN", torch.allclose(got[0], base[0] + delta, atol=0.1, rtol=0.05))
+            print("PLAIN_ROWS", torch.allclose(got[1:], base[1:]))
+    """)
+    with tempfile.TemporaryDirectory() as tmp:
+        result = subprocess.run(
+            [sys.executable, "-c", script.replace("{store}", os.path.join(tmp, "store"))],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "SPYRE_MODEL_RUNNER": "v2"},
+            timeout=600,
+        )
+    assert result.returncode == 0, result.stderr[-4000:]
+    got = dict(
+        line.split(" ", 1) for line in result.stdout.splitlines() if line.split(" ")[0].isupper()
+    )
+    assert got == {
+        "MODE": "STOCK_TORCH_COMPILE",
+        "COMPILED_HOLDS_LORA": "True",
+        "ALL_SPYRE": "True",
+        "LORA_TOKEN": "True",
+        "PLAIN_ROWS": "True",
     }, result.stdout[-3000:]
