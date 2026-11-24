@@ -24,7 +24,7 @@ from spyre_inference.v1.attention.ops import batched_decode as bdhm
 
 BLOCK, HEAD, SCALE = 4, 8, 0.3
 # The block slots of one shared-slot chunk.
-SLOTS = 32
+SLOTS = 64
 
 
 def _inputs(b, bpc, c, kv):
@@ -504,9 +504,9 @@ def test_shared_slot_result_is_returned_scaled_and_never_stored():
 
 
 def test_shared_slots_match_the_per_bucket_kernel_on_a_uniform_batch():
-    """Four sequences of 16 blocks: 8 block slots each over 2 chunks, the per-bucket kernel's
-    B=4, J=8 split in another entry order."""
-    kv, q, b, nb = 2, 4, 4, 16
+    """Four sequences of 32 blocks: 16 block slots each over 2 chunks, the per-bucket kernel's
+    B=4, J=16 split in another entry order."""
+    kv, q, b, nb = 2, 4, 4, 32
     fields, block_table, stacks, num_pages = _shared_slot_case([nb] * b, b, kv)
     assert fields[0][4].shape[0] == 2 * SLOTS
     k_pages, v_pages = _slot_pages(num_pages, kv)
@@ -514,7 +514,7 @@ def test_shared_slots_match_the_per_bucket_kernel_on_a_uniform_batch():
     page_ids = block_table.t().contiguous()
     mask = torch.stack([tiles[:, 0] for tiles in stacks], dim=1).reshape(nb, b, 1, 1, BLOCK)
     bucketed = _call(
-        query, torch.arange(b).repeat(8), k_pages, v_pages, page_ids, mask, b, 8, kv, q
+        query, torch.arange(b).repeat(16), k_pages, v_pages, page_ids, mask, b, 16, kv, q
     )
     torch.testing.assert_close(
         _run_shared_slots(query, k_pages, v_pages, fields, kv, q), bucketed, atol=1e-5, rtol=1e-5

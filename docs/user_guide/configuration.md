@@ -210,7 +210,7 @@ export SPYRE_ATTN_NUM_SEQS_BUCKETS=1,4,8      # default: powers of two up to --m
 
 Warmup records one per-sequence kernel per query bucket and, with the batched-decode kernel
 enabled (`SPYRE_BATCHED_DECODE=1`, the default), one shared-slot kernel for batches of up to
-32 sequences and one batched kernel per larger num-sequences bucket.
+64 sequences and one batched kernel per larger num-sequences bucket.
 
 ### One kernel for every page count
 
@@ -245,26 +245,26 @@ chunk.
 
 #### One batched decode kernel for every batch size
 
-Batched decode of up to 32 sequences (or up to `--max-num-seqs`, if that is lower) does not
+Batched decode of up to 64 sequences (or up to `--max-num-seqs`, if that is lower) does not
 compile kernels per num-sequences bucket.
 
-Each chunk still reads 32 pages, one per core. Each of these 32 reads is a *block slot*. The
-per-bucket kernels above give every sequence the same number of block slots, 32 divided by
-the bucket. These kernels share the 32 block slots by length instead, at every step: a long
-sequence gets many, a short one gets few. So a batch runs only as many chunks as all its pages
-need together, not as many as its longest sequence needs.
+Each chunk of this kernel reads 64 pages, two per core. Each of these 64 reads is a *block
+slot*. The per-bucket kernels above give every sequence the same number of block slots, 32
+divided by the bucket. This kernel shares its 64 block slots by length instead, at every step:
+a long sequence gets many, a short one gets few. So a batch runs only as many chunks as all
+its pages need together, not as many as its longest sequence needs.
 
 For example, take one sequence of 235 pages and four of 5 pages. The kernel for the bucket of
 8 sequences gives each sequence 4 block slots, so the batch runs 59 chunks, most of them
-reading nothing but padding. Shared by length, the long sequence gets 27 block slots and each
-short one gets 1, and the batch runs 9 chunks.
+reading nothing but padding. Shared by length, the long sequence gets 47 block slots and each
+short one gets 1, and the batch runs 5 chunks.
 
-Warmup compiles one of these kernels for every batch size up to 32, instead of one per
-num-sequences bucket. It runs every batch, a single chunk included, up to 32 chunks per call
+Warmup compiles one of these kernels for every batch size up to 64, instead of one per
+num-sequences bucket. It runs every batch, a single chunk included, up to 16 chunks per call
 (more if one sequence at `--max-model-len` needs more). A batch that needs more chunks runs as
 several calls.
 
-Batches of more than 32 sequences keep their per-bucket kernels. A sliding-window layer uses
+Batches of more than 64 sequences keep their per-bucket kernels. A sliding-window layer uses
 the same kernel over the pages its window touches. It needs the same torch-spyre as the dynamic
 chunk count above.
 

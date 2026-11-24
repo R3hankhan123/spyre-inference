@@ -2528,7 +2528,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     _use_batched_decode_kernels(monkeypatch, kernels)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
     # chunk holds 4 pages of each, so the kernel runs 1 to 4 chunks: compiled at 4, then
-    # reused at the others. The shared-slot kernel splits these batches into 1 to 4 chunks too.
+    # reused at the others. The shared-slot kernel's 64 slots fit these batches in 1 or 2.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -2553,7 +2553,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert set(chunk_counts) == {1, 2, 3, 4}, chunk_counts
+    assert set(chunk_counts) == ({1, 2, 3, 4} if kernels == "per_bucket" else {1, 2}), chunk_counts
 
 
 @pytest.mark.parametrize(
@@ -2605,7 +2605,7 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert chunk_shapes == {(1, 32, True)}, chunk_shapes
+    assert chunk_shapes == {(1, 64, True)}, chunk_shapes
 
 
 @pytest.mark.parametrize(
@@ -3398,7 +3398,8 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
         use_per_bucket_decode(monkeypatch)
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
-    num_seqs, num_pages = 4, 64
+    # Above the 64-entry shared-slot gather: a gather may not select every page (#4033).
+    num_seqs, num_pages = 4, 128
 
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
@@ -3429,9 +3430,16 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=mode != "static")
         if mode == "shared_slots":
-            # 32 sequences of one block slot each over the 32 pages.
-            bucket = builder.attn_bucketer.shared_slot_variants()[0]
-            assert (bucket.num_seqs, bucket.num_chunks, bucket.dynamic_chunks) == (32, 32, True)
+            # Recorded at the most chunks one call runs.
+            bucketer = builder.attn_bucketer
+            bucket = bucketer.shared_slot_variants()[0]
+            chunk_range = bucketer.shared_slot_chunk_range
+            assert chunk_range is not None
+            assert (bucket.num_seqs, bucket.num_chunks, bucket.dynamic_chunks) == (
+                bucketer.shared_slot_seqs,
+                chunk_range["max"],
+                True,
+            )
         else:
             # max_model_len 2048 at block size 64 is 32 pages: a call within one chunk of 8
             # blocks at 4 sequences, or the dynamic one at up to 4 chunks.

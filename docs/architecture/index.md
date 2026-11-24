@@ -462,13 +462,13 @@ enumerates its variants: per num-sequences bucket, one dynamic variant, recorded
 chunk count of `max_model_len`, that runs every batch, a single chunk included; variants
 that reach or exceed the allocated page count are skipped and declined at dispatch.
 
-With the shared-slot kernel, the num-sequences buckets up to `S = min(32, max_num_seqs)`
-record nothing of their own. A chunk has 32 *block slots*, one page each, and each block slot
-keeps its own running softmax across chunks. The per-bucket kernels give every sequence
-`32 / bucket` block slots. The shared-slot kernel lets the host share them out by length at
+With the shared-slot kernel, the num-sequences buckets up to `S = min(64, max_num_seqs)`
+record nothing of their own. Its chunk has 64 *block slots*, one page each, and each block
+slot keeps its own running softmax across chunks. The per-bucket kernels give every sequence
+`32 / bucket` block slots of a 32-page chunk. The shared-slot kernel lets the host share them out by length at
 every step instead: it picks the fewest chunks `C` that fit the batch and gives each sequence
 `ceil(blocks / C)` consecutive block slots. At chunk `c`, a sequence's block slot `k` reads
-its block `c * slots + k`. After the last chunk, an `[S, 32]` one-hot sums each sequence's
+its block `c * slots + k`. After the last chunk, an `[S, 64]` one-hot sums each sequence's
 block slots into its output row with a matmul batched over the KV heads and the queries per
 KV head, the two batch axes `lower_bmm` allows. Output rows past the batch copy row 0, so
 they stay finite. The merged rows come out of a permute, whose in-graph store into the
@@ -476,7 +476,7 @@ row-outermost staging buffer misplaces rows, so the dispatch stores them with on
 row scatter.
 
 One dynamic variant serves every batch of up to `S` sequences, a single chunk included. It
-runs at most 32 chunks per call, or as many as one `max_model_len` sequence needs if that is
+runs at most 16 chunks per call, or as many as one `max_model_len` sequence needs if that is
 more. This keeps its launches cheap, because every launch of a dynamic kernel prepares host
 data for every chunk in its range. A batch that needs more chunks runs as several grouped
 calls. Its range starts at one chunk (two with a layer of one KV head), and it is traced with
@@ -569,7 +569,7 @@ Key constraints:
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
   each bucket's dynamic kernel is recorded during warmup. With the shared-slot kernel,
-  only the buckets above 32 sequences are, since that kernel serves every batch of up to 32
+  only the buckets above 64 sequences are, since that kernel serves every batch of up to 64
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a

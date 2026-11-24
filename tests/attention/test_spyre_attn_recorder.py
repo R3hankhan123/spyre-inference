@@ -953,7 +953,7 @@ def _batched_key(md) -> tuple[int, int, int, bool, bool]:
 
 @pytest.fixture()
 def shared_slot_builder(builder, monkeypatch):
-    """The shared-slot kernel over 128 pages: 8 rows, running 1 to 32 chunks."""
+    """The shared-slot kernel over 128 pages: 8 rows, running 1 to 16 chunks."""
     from torch_spyre._inductor import config as ts_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
@@ -1029,15 +1029,16 @@ def test_shared_slot_mode_records_its_kernels_and_the_buckets_above(
 ):
     """One shared-slot kernel serves up to shared_slot_seqs sequences; only the buckets above
     keep theirs."""
-    pages = 128
+    # Above the 128-sequence bucket's 128-entry gather (#4033).
+    pages = 256
     cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
     bucketer = shared_slot_builder._attn_bucketer = make_bucketer(
-        max_model_len=8192, max_num_seqs=64, declare_pages=True
+        max_model_len=8192, max_num_seqs=128, declare_pages=True
     )
     shared = bucketer.shared_slot_variants()
     above = bucketer.batched_decode_variants()
-    assert [v.num_seqs for v in shared] == [32]
-    assert {v.num_seqs for v in above} == {64}
+    assert [v.num_seqs for v in shared] == [64]
+    assert {v.num_seqs for v in above} == {128}
 
     assert _record(impl, cache, shared_slot_builder) == len(_recordable(bucketer, pages)) + len(
         shared
@@ -1050,10 +1051,11 @@ def test_shared_slot_dispatch_after_recording_compiles_nothing(
     """The acceptance criterion in shared-slot mode: once warmup has recorded its kernels,
     decode batches of any size up to shared_slot_seqs and any lengths compile nothing. The
     dynamic kernel runs every chunk count, one chunk included."""
-    # 16 pages: the dynamic shared-slot kernel runs 1 to 4 chunks of 8 sequences.
+    # 16 pages: the dynamic shared-slot kernel runs 1 to 2 chunks of 8 sequences.
     shared_slot_builder._attn_bucketer = make_bucketer(max_model_len=1024, declare_pages=True)
-    assert shared_slot_builder.attn_bucketer.shared_slot_chunk_range["max"] == 4
-    pages = 64
+    assert shared_slot_builder.attn_bucketer.shared_slot_chunk_range["max"] == 2
+    # Above the 64-entry gather (#4033).
+    pages = 128
     cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
     _record(impl, cache, shared_slot_builder)
     q_staging, out_staging = impl._staging_buffers(spyre_device)
@@ -1072,4 +1074,4 @@ def test_shared_slot_dispatch_after_recording_compiles_nothing(
         chunk_counts.add(_batched_key(md)[2])
         impl.forward(MagicMock(), q_staging, q_staging, q_staging, cache, md, out_staging)
     assert compiles() == snapshot
-    assert chunk_counts == {1, 2, 3, 4}
+    assert chunk_counts == {1, 2}

@@ -195,22 +195,21 @@ def shared_slot_config(default_vllm_config, monkeypatch):
 
 
 def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_config):
-    """1 x 235 + 4 x 5 blocks: 27 block slots and 1 each over 9 chunks together, 8 + 1 apart."""
+    """1 x 235 + 4 x 5 blocks: 47 block slots and 1 each over 5 chunks together, 4 + 1 apart."""
     md = _build([235 * BLOCK] + [5 * BLOCK] * 4)
     assert md.shared_slot_seqs == 32
-    assert md.padded_batch_blocks == 9 * 32
+    assert md.padded_batch_blocks == 5 * 64
     assert md.decode_groups is None
 
 
-def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_slot_config):
-    """1 x 256 + 31 x 8 blocks: one block slot each over 256 chunks together, past one call's 32;
-    8 + 8 apart."""
-    md = _build([256 * BLOCK] + [8 * BLOCK] * 31)
+def test_shared_slot_grouping_splits_long_sequences_from_many_short(shared_slot_config):
+    """3 x 256 + 29 x 8 blocks need 17 chunks together, past one call's 16; 13 + 4 apart."""
+    md = _build([256 * BLOCK] * 3 + [8 * BLOCK] * 29)
     assert md.padded_num_seqs is None
-    assert _members(md) == [[0], list(range(1, 32))]
-    assert [(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups] == [
-        (32, 8),
-        (32, 8),
+    assert _members(md) == [[0, 1, 2], list(range(3, 32))]
+    assert [(g.shared_slot_seqs, g.padded_batch_blocks // 64) for g in md.decode_groups] == [
+        (32, 13),
+        (32, 4),
     ]
 
 
@@ -218,21 +217,21 @@ def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_sl
 def test_a_shared_slot_batch_past_one_call_splits_into_calls_that_fit(
     shared_slot_config, monkeypatch, jagged
 ):
-    """32 x 256 blocks need 256 chunks in one call; 8 calls of 4 sequences need 32 each, the
+    """32 x 256 blocks need 128 chunks in one call; 8 calls of 4 sequences need 16 each, the
     most one call runs. Splitting is not jagged grouping, so it happens with that off too."""
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", jagged)
     md = _build([256 * BLOCK] * 32)
     assert md.padded_num_seqs is None
     assert _members(md) == [list(range(i, i + 4)) for i in range(0, 32, 4)]
-    assert {(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups} == {
-        (32, 32)
+    assert {(g.shared_slot_seqs, g.padded_batch_blocks // 64) for g in md.decode_groups} == {
+        (32, 16)
     }
 
 
 def test_each_shared_slot_group_matches_its_own_batch(shared_slot_config):
     """A shared-slot group's precomputes are those of a batch holding only its members, with its
     query rows mapped back to their place in the full batch."""
-    kv_lens = [256 * BLOCK] + [8 * BLOCK] * 31
+    kv_lens = [256 * BLOCK] * 3 + [8 * BLOCK] * 29
     block_table = torch.randperm(len(kv_lens) * 256, dtype=torch.int32).reshape(-1, 256)
     md = _build(kv_lens, block_table=block_table)
     assert md.decode_groups is not None
@@ -262,7 +261,7 @@ def test_shared_slot_groups_store_every_row_once(shared_slot_config):
         _scatter_rows_kernel,
     )
 
-    kv_lens = [256 * BLOCK] + [8 * BLOCK] * 31
+    kv_lens = [256 * BLOCK] * 3 + [8 * BLOCK] * 29
     md = _build(kv_lens)
     staging_rows = len(kv_lens) + 1
     owner = SimpleNamespace(staging_rows=staging_rows)
@@ -286,5 +285,5 @@ def test_shared_slot_call_covers_only_the_decode_prefix(shared_slot_config):
     assert md.rep_row_ids_cpu.max() < 2
     # [rows, slots] -> [slots, rows]
     onehot = md.slot_onehot_cpu[0, 0].t()
-    assert onehot.shape == (32, 32)
+    assert onehot.shape == (64, 32)
     assert torch.equal(onehot[:, 2:], onehot[:, :1].expand(-1, 30))
