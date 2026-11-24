@@ -1199,7 +1199,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 chunk_range = plan.chunk_range
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
+                # One shared-slot call already balances the sequences by length.
+                shared = isinstance(plan, SharedSlotPlan)
+                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0 and not shared:
                     decode_groups = self._batched_decode_groups(decode_blocks, *rest)
 
         return SpyreAttentionMetadata(
@@ -1406,30 +1408,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             mask_by_chunk_cpu,
         )
 
-    def _batched_decode_groups(
+    def _length_class_groups(
         self,
         decode_blocks: list[int],
-        blocks_per_seq: list[int],
-        block_table: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        active_block_indices: list | None,
-        attention_mask_stacks: list[torch.Tensor],
-    ) -> "list[BatchedDecodeGroup] | None":
-        """The decode sequences in groups of one batched call each: by power-of-two length
-        class, a class past one shared-slot call's chunks split, then neighbours merged while
-        one call runs them in at most ``_GROUP_DISPATCH_CHUNKS`` more chunks than two. None
-        for a single group, or when a group has no kernel."""
-        bucketer = self._attn_bucketer
-
-        def group_plan(members: list[int]) -> BatchedDecodePlan | SharedSlotPlan | None:
-            return self._batched_decode_call_plan([decode_blocks[m] for m in members])
-
-        def chunks(members: list[int]) -> int | None:
-            plan = group_plan(members)
-            return None if plan is None else plan.num_chunks
-
-        # Seeded by power-of-two length class, which keeps the merge below to a handful of
-        # candidates; it joins neighbouring classes whose chunk counts barely differ.
+        group_plan: Callable[[list[int]], "BatchedDecodePlan | SharedSlotPlan | None"],
+        chunks: Callable[[list[int]], int | None],
+    ) -> list[list[int]] | None:
+        """Groups seeded by power-of-two length class, which keeps the merge below to a
+        handful of candidates; it joins neighbouring classes whose chunk counts barely
+        differ. None when a group has no kernel."""
         by_class: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
             by_class.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
@@ -1440,7 +1427,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 groups.append(members)
                 continue
             # A class past one shared-slot call's chunks splits into calls that fit.
-            parts = bucketer.shared_slot_call_groups([decode_blocks[m] for m in members])
+            parts = self._attn_bucketer.shared_slot_call_groups(
+                [decode_blocks[m] for m in members], _GROUP_DISPATCH_CHUNKS
+            )
             if parts is None:
                 return None
             groups.extend([members[j] for j in part] for part in parts)
@@ -1459,6 +1448,57 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
                     break
+        return groups
+
+    def _batched_decode_groups(
+        self,
+        decode_blocks: list[int],
+        blocks_per_seq: list[int],
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        active_block_indices: list | None,
+        attention_mask_stacks: list[torch.Tensor],
+    ) -> "list[BatchedDecodeGroup] | None":
+        """The decode sequences in groups of one batched call each. None for a single group,
+        or when a group has no kernel.
+
+        A batch the shared-slot kernel takes is split only past one call's chunks: by trips
+        (``shared_slot_call_groups``) or by length class, whichever runs fewer chunks plus
+        ``_GROUP_DISPATCH_CHUNKS`` per call. A wider one goes by power-of-two length class, a
+        class past one shared-slot call's chunks split, then neighbours merged while one call
+        runs them in at most ``_GROUP_DISPATCH_CHUNKS`` more chunks than two.
+        """
+        bucketer = self._attn_bucketer
+
+        def group_plan(members: list[int]) -> BatchedDecodePlan | SharedSlotPlan | None:
+            return self._batched_decode_call_plan([decode_blocks[m] for m in members])
+
+        def chunks(members: list[int]) -> int | None:
+            plan = group_plan(members)
+            return None if plan is None else plan.num_chunks
+
+        if len(decode_blocks) <= (bucketer.shared_slot_seqs or 0):
+            candidates = [
+                g
+                for g in (
+                    bucketer.shared_slot_call_groups(decode_blocks, _GROUP_DISPATCH_CHUNKS),
+                    self._length_class_groups(decode_blocks, group_plan, chunks),
+                )
+                if g is not None
+            ]
+            if not candidates:
+                return None
+
+            def cost(calls: list[list[int]]) -> int:
+                return sum(chunks(call) or 0 for call in calls) + _GROUP_DISPATCH_CHUNKS * len(
+                    calls
+                )
+
+            groups = min(candidates, key=cost)
+        else:
+            groups = self._length_class_groups(decode_blocks, group_plan, chunks)
+            if groups is None:
+                return None
         if len(groups) == 1:
             return None
         out = []

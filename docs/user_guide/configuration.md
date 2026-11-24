@@ -262,7 +262,8 @@ short one gets 1, and the batch runs 5 chunks.
 Warmup compiles one of these kernels for every batch size up to 64, instead of one per
 num-sequences bucket. It runs every batch, a single chunk included, up to 16 chunks per call
 (more if one sequence at `--max-model-len` needs more). A batch that needs more chunks runs as
-several calls.
+several calls, split so that long sequences land in different calls and short ones fill in
+beside them. A batch that fits one call is never split.
 
 Batches of more than 64 sequences keep their per-bucket kernels. A sliding-window layer uses
 the same kernel over the pages its window touches. It needs the same torch-spyre as the dynamic

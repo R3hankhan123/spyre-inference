@@ -615,25 +615,71 @@ class SpyreAttnBucketer:
             return None
         return SharedSlotPlan(max(num_chunks, chunk_range["min"]), chunk_range, slots)
 
-    def shared_slot_call_groups(self, blocks: list[int]) -> list[list[int]] | None:
-        """The indices of ``blocks`` split into shared-slot calls, longest sequences first,
-        each taking the first call it fits; None without the shared-slot kernel or when
+    def shared_slot_call_groups(
+        self, blocks: list[int], call_chunks: int = 0
+    ) -> list[list[int]] | None:
+        """The indices of ``blocks`` split into shared-slot calls by trips, at the least
+        chunks plus ``call_chunks`` per call. None without the shared-slot kernel or when
         there are more than ``shared_slot_seqs`` sequences.
 
+        The candidates are first fit, longest first, and every call count up to one past it
+        with each sequence, longest first, joining the call with the fewest pages that still
+        fits it: long sequences land in different calls and short ones fill in beside them.
         A single sequence always fits one call, since the chunk range reaches what one
         max_model_len sequence needs.
         """
         if self._shared_slot_chunk_range is None or len(blocks) > self._shared_slot_seqs:
             return None
-        groups: list[list[int]] = []
-        for i in sorted(range(len(blocks)), key=lambda i: -blocks[i]):
-            for group in groups:
-                if self.shared_slot_plan([blocks[j] for j in (*group, i)]) is not None:
-                    group.append(i)
+        order = sorted(range(len(blocks)), key=lambda i: -blocks[i])
+
+        def plan(group: list[int]) -> SharedSlotPlan | None:
+            return self.shared_slot_plan([blocks[j] for j in group])
+
+        def fits(group: list[int], i: int) -> bool:
+            return plan([*group, i]) is not None
+
+        def cost(calls: list[list[int]]) -> int:
+            total = call_chunks * len(calls)
+            for call in calls:
+                call_plan = plan(call)
+                assert call_plan is not None
+                total += call_plan.num_chunks
+            return total
+
+        first_fit: list[list[int]] = []
+        for i in order:
+            group = next((g for g in first_fit if fits(g, i)), None)
+            if group is None:
+                first_fit.append([i])
+            else:
+                group.append(i)
+        candidates = [first_fit]
+        for num_calls in range(1, len(first_fit) + 2):
+            balanced = self._balanced_calls(order, blocks, num_calls, fits)
+            if balanced is not None:
+                candidates.append(balanced)
+        return min(candidates, key=cost)
+
+    @staticmethod
+    def _balanced_calls(
+        order: list[int],
+        blocks: list[int],
+        num_calls: int,
+        fits: Callable[[list[int], int], bool],
+    ) -> list[list[int]] | None:
+        """``order`` placed onto ``num_calls`` calls, each index on the call with the fewest
+        pages that fits it; None when one fits none."""
+        calls: list[list[int]] = [[] for _ in range(num_calls)]
+        pages = [0] * num_calls
+        for i in order:
+            for c in sorted(range(num_calls), key=lambda c: pages[c]):
+                if fits(calls[c], i):
+                    calls[c].append(i)
+                    pages[c] += blocks[i]
                     break
             else:
-                groups.append([i])
-        return groups
+                return None
+        return [call for call in calls if call]
 
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""

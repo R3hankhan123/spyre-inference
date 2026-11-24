@@ -766,6 +766,21 @@ class TestSharedSlotDecode:
             plan = b.shared_slot_plan([blocks[i] for i in group])
             assert plan is not None and plan.num_chunks <= 16
 
+    def test_calls_are_balanced_by_trips(self):
+        # 256 pages: 3 x 256 + 29 x 8 need 17 chunks in one call, past its 16. First fit puts
+        # the long ones together (13 chunks) apart from the short ones (4).
+        b = SpyreAttnBucketer(make_config(max_model_len=16384, max_num_seqs=32), declare_pages=True)
+        blocks = [256] * 3 + [8] * 29
+        assert b.shared_slot_plan(blocks) is None
+        groups = b.shared_slot_call_groups(blocks, call_chunks=2)
+        assert groups == [[0, 2], [1, *range(3, 32)]]
+        chunks = []
+        for group in groups:
+            plan = b.shared_slot_plan([blocks[i] for i in group])
+            assert plan is not None
+            chunks.append(plan.num_chunks)
+        assert chunks == [8, 8]
+
     def test_one_max_model_len_sequence_always_fits_one_call(self):
         # 2048 pages: one sequence needs 32 chunks, past the usual 16.
         b = SpyreAttnBucketer(

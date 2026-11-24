@@ -479,7 +479,10 @@ One dynamic variant serves every batch of up to `S` sequences, a single chunk in
 runs at most 16 chunks per call, or as many as one `max_model_len` sequence needs if that is
 more. This keeps its launches cheap, because every launch of a dynamic kernel prepares host
 data for every chunk in its range. A batch that needs more chunks runs as several grouped
-calls. Its range starts at one chunk (two with a layer of one KV head), and it is traced with
+calls, split by trips: the fewest chunks plus `_GROUP_DISPATCH_CHUNKS` per call, over first
+fit and every call count where each sequence, longest first, joins the call with the fewest
+pages that still fits it, or the length-class grouping if that costs less. A batch that fits
+one call is not split. Its range starts at one chunk (two with a layer of one KV head), and it is traced with
 `backed_size_oblivious` so that a single chunk does not get its own compiled kernel.
 
 A single step can carry a mix of prefill and decode sequences; each sequence is padded to

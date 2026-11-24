@@ -202,14 +202,16 @@ def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_c
     assert md.decode_groups is None
 
 
-def test_shared_slot_grouping_splits_long_sequences_from_many_short(shared_slot_config):
-    """3 x 256 + 29 x 8 blocks need 17 chunks together, past one call's 16; 13 + 4 apart."""
+def test_shared_slot_grouping_balances_the_calls_by_trips(shared_slot_config):
+    """3 x 256 + 29 x 8 blocks need 17 chunks together, past one call's 16. By length class
+    the long ones take 13 chunks and the short ones 4; by trips two long ones share a call
+    and the third runs beside the short ones, 8 + 8."""
     md = _build([256 * BLOCK] * 3 + [8 * BLOCK] * 29)
     assert md.padded_num_seqs is None
-    assert _members(md) == [[0, 1, 2], list(range(3, 32))]
+    assert _members(md) == [[0, 2], [1, *range(3, 32)]]
     assert [(g.shared_slot_seqs, g.padded_batch_blocks // 64) for g in md.decode_groups] == [
-        (32, 13),
-        (32, 4),
+        (32, 8),
+        (32, 8),
     ]
 
 
