@@ -559,7 +559,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # The chunk counts this batch's dynamic kernel runs; the chunk index and mask are
     # copied to the device with this range. None for a kernel with a fixed chunk count.
     chunk_range: DynamicRange | None = None
-    # Shared-slot mode: the gather is the B=1, J=slots one above, and the kernel returns
+    # Shared-slot mode: the gather is the B=1, J=slots one above, and the kernel writes
     # shared_slot_seqs output rows. None otherwise.
     shared_slot_seqs: int | None = None
     # [slots] int32: the row each block slot's maximum is read from.
@@ -569,8 +569,6 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # block slot counts towards, repeated per head for the merge's matmul.
     slot_onehot_cpu: torch.Tensor | None = None
     slot_onehot_dev: torch.Tensor | None = None
-    # [shared_slot_seqs] int32: the staging row each output row is stored to.
-    slot_store_rows_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
@@ -2341,7 +2339,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: torch.Tensor,
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
-        store_rows: torch.Tensor | None = None,
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here: K/V/q keep
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
@@ -2358,14 +2355,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
         assert (attn_metadata.shared_slot_seqs is None) == (attn_metadata.slot_onehot_dev is None)
-        # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
-        # b_seqs, not the real count -- into the staging buffers warmup recorded with.
+        # The kernel's store writes out[:out_rows] -- the seq bucket or the shared-slot rows,
+        # not the real count -- into the staging buffers warmup recorded with.
         q_staging, _ = self._staging_buffers(query_dev.device)
         assert query_dev is q_staging, "batched decode runs on the staging buffers only"
         assert output.shape == q_staging.shape and output.dtype == q_staging.dtype
 
-        shared = attn_metadata.shared_slot_seqs is not None
-        result = self._run_batched_decode(
+        self._run_batched_decode(
             query_dev,
             attn_metadata.rep_row_ids_dev,
             k_pages,
@@ -2376,19 +2372,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             b_seqs,
             blocks_per_chunk,
             block_size,
-            None if shared else output,
+            output,
             attn_metadata.slot_row_ids_dev,
             attn_metadata.slot_onehot_dev,
-        )
-        if not shared:
-            return
-        # A shared-slot result's rows come out of the merge's permute, which the kernel
-        # cannot store in-graph; one compiled scatter of the bucket's shape stores them, so
-        # warmup's recording compiles it.
-        rows = store_rows if store_rows is not None else attn_metadata.slot_store_rows_dev
-        assert rows is not None
-        _scatter_rows_compiled(
-            output, rows, result.reshape(out_rows, self.num_heads, self.head_size)
         )
 
     def _grouped_decode_preconditions_met(
@@ -2433,7 +2419,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     slot_row_ids_dev=None,
                     slot_onehot_cpu=group.slot_onehot_cpu,
                     slot_onehot_dev=None,
-                    slot_store_rows_dev=None,
                     decode_groups=None,
                 )
                 self._mirror_batched_decode_indices(group.metadata, device)
@@ -2441,16 +2426,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self._group_store_rows(group.rows_cpu.tolist(), group.out_rows),
                     device=device,
                 )
-            assert group.rows_dev is not None
-            if group.shared_slot_seqs is not None:
-                # Its scatter stores straight into the batch's rows.
-                self._run_batched_decode_dispatch(
-                    query_dev, k_pages, v_pages, group.metadata, store, group.rows_dev
-                )
-                continue
             self._run_batched_decode_dispatch(
                 query_dev, k_pages, v_pages, group.metadata, group_out
             )
+            assert group.rows_dev is not None
             _scatter_rows_compiled(store, group.rows_dev, group_out)
         if store is not output:
             num_decode_seqs = attn_metadata.num_decode_seqs
@@ -2475,13 +2454,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             assert attn_metadata.slot_onehot_cpu is not None
             attn_metadata.slot_row_ids_dev = convert(attn_metadata.slot_row_ids_cpu, device=device)
             attn_metadata.slot_onehot_dev = convert(attn_metadata.slot_onehot_cpu, device=device)
-            # The decode prefix's rows are range(num_decode_seqs) (asserted in the builder).
-            attn_metadata.slot_store_rows_dev = convert(
-                self._group_store_rows(
-                    list(range(attn_metadata.num_decode_seqs)), attn_metadata.shared_slot_seqs
-                ),
-                device=device,
-            )
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         b = attn_metadata.padded_num_seqs

@@ -182,9 +182,7 @@ def batched_decode_kernel(
 
     Shared-slot mode: ``slot_row_ids`` [E] and ``slot_onehot`` [KV, Q, R, E] (see
     ``_merge_shared_slots``), with num_seqs=1 and blocks_per_chunk=E. The output is
-    [R, num_heads, head_size], and it is returned rather than stored: its rows come out of
-    a permute, whose in-graph store into the row-outermost staging buffer misplaces every
-    row past the first.
+    [R, num_heads, head_size], stored in ``out[:R]`` like any other result.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -291,7 +289,6 @@ def batched_decode_kernel(
     )
     tile_max, tile_sum, tile_output = carry
     if slot_onehot is not None:
-        assert out is None, "the caller stores a shared-slot result"
         attn = _merge_shared_slots(
             tile_max=tile_max,
             tile_sum=tile_sum,
@@ -323,6 +320,6 @@ def batched_decode_kernel(
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        out[: attn.shape[0]].copy_(attn)
         return out
     return attn

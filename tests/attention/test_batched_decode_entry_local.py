@@ -488,19 +488,17 @@ def test_shared_slot_padding_rows_stay_finite_beside_a_dominant_slot():
     assert torch.equal(got[1:], got[:1].expand(3, -1, -1))
 
 
-def test_shared_slot_result_is_returned_scaled_and_never_stored():
-    """The result is scaled by v_scale and returned; the caller scatters it, since the merge's
-    permuted rows cannot be stored in-graph."""
+def test_shared_slot_store_writes_its_rows_from_row_zero():
+    """``out`` takes exactly the slot rows, scaled by v_scale; rows past them are untouched."""
     kv, q, blocks, rows = 2, 4, [40, 7], 4
     fields, _, _, num_pages = _shared_slot_case(blocks, rows, kv)
     k_pages, v_pages = _slot_pages(num_pages, kv)
     query = torch.randn(9, kv, q, HEAD)
+    out = torch.full((9, kv * q, HEAD), float("nan"))
     expected = _run_shared_slots(query, k_pages, v_pages, fields, kv, q) * 0.5
-    got = _run_shared_slots(query, k_pages, v_pages, fields, kv, q, v_scale=0.5)
-    assert got.shape == (rows, kv * q, HEAD)
-    torch.testing.assert_close(got, expected)
-    with pytest.raises(AssertionError):
-        _run_shared_slots(query, k_pages, v_pages, fields, kv, q, out=torch.zeros(9, kv * q, HEAD))
+    assert _run_shared_slots(query, k_pages, v_pages, fields, kv, q, out=out, v_scale=0.5) is out
+    torch.testing.assert_close(out[:rows], expected)
+    assert out[rows:].isnan().all()
 
 
 def test_shared_slots_match_the_per_bucket_kernel_on_a_uniform_batch():

@@ -471,9 +471,8 @@ every step instead: it picks the fewest chunks `C` that fit the batch and gives 
 its block `c * slots + k`. After the last chunk, an `[S, 64]` one-hot sums each sequence's
 block slots into its output row with a matmul batched over the KV heads and the queries per
 KV head, the two batch axes `lower_bmm` allows. Output rows past the batch copy row 0, so
-they stay finite. The merged rows come out of a permute, whose in-graph store into the
-row-outermost staging buffer misplaces rows, so the dispatch stores them with one compiled
-row scatter.
+they stay finite. The kernel stores the merged rows into the staging buffer in the same
+graph, as the per-bucket kernels do.
 
 One dynamic variant serves every batch of up to `S` sequences, a single chunk included. It
 runs at most 16 chunks per call, or as many as one `max_model_len` sequence needs if that is
