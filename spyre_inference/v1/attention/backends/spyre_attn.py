@@ -74,6 +74,7 @@ from spyre_inference.v1.attention.ops.reshape_and_cache import (
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     BatchedDecodePlan,
     DynamicRange,
+    SharedSlotPlan,
     SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
@@ -140,8 +141,14 @@ class BatchedDecodeGroup:
     chunk_page_ids_cpu: torch.Tensor
     mask_by_chunk_cpu: torch.Tensor
     chunk_range: DynamicRange | None
+    shared_slot_seqs: int | None = None
+    slot_onehot_cpu: torch.Tensor | None = None
     rows_dev: torch.Tensor | None = None
     metadata: "SpyreAttentionMetadata | None" = None
+
+    @property
+    def out_rows(self) -> int:
+        return self.shared_slot_seqs or self.padded_num_seqs
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -550,6 +557,12 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # The chunk counts this batch's dynamic kernel runs; the chunk index and mask are
     # copied to the device with this range. None for a kernel with a fixed chunk count.
     chunk_range: DynamicRange | None = None
+    # Shared-slot mode: the gather is the B=1, J=32 one above, and the kernel writes
+    # shared_slot_seqs output rows. None otherwise.
+    shared_slot_seqs: int | None = None
+    # [32, shared_slot_seqs, 1, 1, 1] model dtype: the rows each block slot counts towards.
+    slot_onehot_cpu: torch.Tensor | None = None
+    slot_onehot_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
@@ -561,6 +574,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
+
+    @property
+    def batched_out_rows(self) -> int | None:
+        """The output rows the batched kernel writes, from row 0."""
+        return self.shared_slot_seqs or self.padded_num_seqs
 
     def seq_page_range(self, seq_idx: int) -> DynamicRange | None:
         """Return the page range sequence ``seq_idx``'s page table and mask stack are
@@ -1125,6 +1143,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
         chunk_range = None
+        shared_slot_seqs = None
+        slot_onehot_cpu = None
         decode_groups = None
         decode_uniformity = 0.0
         if not per_seq_only and envs.SPYRE_BATCHED_DECODE and num_decode_seqs > 0:
@@ -1132,18 +1152,31 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
-            b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            plan = (
-                self._attn_bucketer.batched_decode_plan(b_seqs, max(decode_blocks))
-                if b_seqs is not None
-                else None
+            plan = self._batched_decode_call_plan(decode_blocks)
+            rest = (
+                blocks_per_seq,
+                block_table,
+                query_start_loc,
+                active_block_indices,
+                attention_mask_stacks,
             )
+            # Mean/max block count: how uniform the contexts are, independent of
+            # bucket round-up (which padding the denser ladder addresses instead).
+            uniformity = (sum(decode_blocks) / num_decode_seqs) / max(1, max(decode_blocks))
 
-            if b_seqs is not None and plan is not None:
-                # Mean/max block count: how uniform the contexts are, independent of
-                # chunk round-up.
-                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
+            if plan is None:
+                # More chunks than one shared-slot call runs.
+                decode_groups = self._batched_decode_groups(decode_blocks, *rest)
+                if decode_groups is not None:
+                    decode_uniformity = uniformity
+            else:
+                decode_uniformity = uniformity
                 prefix = list(range(num_decode_seqs))
+                if isinstance(plan, SharedSlotPlan):
+                    shared_slot_seqs = self._attn_bucketer.shared_slot_seqs
+                    fields, slot_onehot_cpu = self._shared_slot_tensors(prefix, plan, *rest)
+                else:
+                    fields = self._batched_decode_tensors(prefix, plan, *rest)
                 (
                     padded_num_seqs,
                     blocks_per_chunk,
@@ -1151,28 +1184,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     rep_row_ids_cpu,
                     chunk_page_ids_cpu,
                     mask_by_chunk_cpu,
-                ) = self._batched_decode_tensors(
-                    prefix,
-                    b_seqs,
-                    plan,
-                    blocks_per_seq,
-                    block_table,
-                    query_start_loc,
-                    active_block_indices,
-                    attention_mask_stacks,
-                )
+                ) = fields
                 chunk_range = plan.chunk_range
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
                 if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
-                    decode_groups = self._batched_decode_groups(
-                        decode_blocks,
-                        blocks_per_seq,
-                        block_table,
-                        query_start_loc,
-                        active_block_indices,
-                        attention_mask_stacks,
-                    )
+                    decode_groups = self._batched_decode_groups(decode_blocks, *rest)
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -1205,13 +1222,88 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
             chunk_range=chunk_range,
+            shared_slot_seqs=shared_slot_seqs,
+            slot_onehot_cpu=slot_onehot_cpu,
             decode_groups=decode_groups,
         )
+
+    def _batched_decode_call_plan(
+        self, blocks: list[int]
+    ) -> BatchedDecodePlan | SharedSlotPlan | None:
+        """How to run one batched call over sequences of ``blocks`` pages: on the shared-slot
+        kernels when they take this many sequences, else on its num_seqs bucket's kernels.
+        None when neither runs it in one call."""
+        bucketer = self._attn_bucketer
+        slot_plan = bucketer.shared_slot_plan(blocks)
+        if slot_plan is not None or len(blocks) <= (bucketer.shared_slot_seqs or 0):
+            return slot_plan
+        b_seqs = bucketer.find_sequence_bucket(len(blocks))
+        return None if b_seqs is None else bucketer.batched_decode_plan(b_seqs, max(blocks))
+
+    def _shared_slot_tensors(
+        self,
+        members: list[int],
+        plan: SharedSlotPlan,
+        blocks_per_seq: list[int],
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        active_block_indices: list | None,
+        attention_mask_stacks: list[torch.Tensor],
+    ) -> tuple[tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        """The shared-slot kernel's inputs, in the batched kernel's layout at B=1 and J=32,
+        and the ``[slots, rows, 1, 1, 1]`` one-hot that merges them.
+
+        Member i takes ``plan.slots[i]`` consecutive block slots, and at chunk c its slot k
+        reads block ``c * plan.slots[i] + k``. A spare slot reads page 0 under an all--inf
+        mask and is in no row. A row past the members sums row 0's slots, so it is finite.
+        """
+        slots = _SPYRE_CORES
+        rows = self._attn_bucketer.shared_slot_seqs
+        assert rows is not None and len(members) <= rows
+        num_chunks = plan.num_chunks
+        block_size = self.block_size
+        rep_row_ids = torch.zeros(slots, dtype=torch.int32)
+        slot_onehot = torch.zeros(slots, rows, dtype=self.model_dtype)
+        page_ids = torch.zeros(num_chunks, slots, dtype=torch.int32)
+        mask = torch.full((num_chunks, slots, block_size), float("-inf"), dtype=self.model_dtype)
+        first = 0
+        for row, (m, width) in enumerate(zip(members, plan.slots, strict=True)):
+            n_blocks = blocks_per_seq[m]
+            span = num_chunks * width
+            assert n_blocks <= span
+            # Position i is the i-th ACTIVE block, matching the mask tiles.
+            cols = slice(n_blocks) if active_block_indices is None else active_block_indices[m]
+            seq_pages = torch.zeros(span, dtype=torch.int32)
+            seq_pages[:n_blocks] = block_table[m, cols]
+            seq_mask = mask.new_full((span, block_size), float("-inf"))
+            seq_mask[:n_blocks] = attention_mask_stacks[m][:n_blocks, 0]
+            own = slice(first, first + width)
+            page_ids[:, own] = seq_pages.reshape(num_chunks, width)
+            mask[:, own] = seq_mask.reshape(num_chunks, width, block_size)
+            rep_row_ids[own] = int(query_start_loc[m])
+            slot_onehot[own, row] = 1
+            first += width
+        slot_onehot[:, len(members) :] = slot_onehot[:, :1]
+        # The KV axis is materialized, as in _batched_decode_tensors.
+        mask_by_chunk = (
+            mask.reshape(num_chunks * slots, 1, 1, 1, block_size)
+            .expand(-1, -1, self.num_kv_heads, -1, -1)
+            .contiguous()
+        )
+        fields = (
+            1,
+            slots,
+            num_chunks * slots,
+            rep_row_ids,
+            page_ids.reshape(num_chunks * slots, 1),
+            mask_by_chunk,
+        )
+        # The carry's rank, so every input of the merge's pointwise ops has it too.
+        return fields, slot_onehot.reshape(slots, rows, 1, 1, 1)
 
     def _batched_decode_tensors(
         self,
         members: list[int],
-        b_seqs: int,
         plan: BatchedDecodePlan,
         blocks_per_seq: list[int],
         block_table: torch.Tensor,
@@ -1221,6 +1313,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     ) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
         block_size = self.block_size
         n = len(members)
+        b_seqs = self._attn_bucketer.find_sequence_bucket(n)
+        assert b_seqs is not None
         decode_blocks = [blocks_per_seq[m] for m in members]
         # Padding columns gather page 0 under an all--inf mask and
         # contribute zero; chunk 0 still holds every real row's block 0,
@@ -1300,13 +1394,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
     ) -> "list[BatchedDecodeGroup] | None":
+        """The decode sequences in groups of one batched call each: by power-of-two length
+        class, a class past one shared-slot call's chunks split, then neighbours merged while
+        one call runs them in at most ``_GROUP_DISPATCH_CHUNKS`` more chunks than two. None
+        for a single group, or when a group has no kernel."""
         bucketer = self._attn_bucketer
 
-        def group_plan(members: list[int]) -> BatchedDecodePlan | None:
-            b_seqs = bucketer.find_sequence_bucket(len(members))
-            if b_seqs is None:
-                return None
-            return bucketer.batched_decode_plan(b_seqs, max(decode_blocks[m] for m in members))
+        def group_plan(members: list[int]) -> BatchedDecodePlan | SharedSlotPlan | None:
+            return self._batched_decode_call_plan([decode_blocks[m] for m in members])
 
         def chunks(members: list[int]) -> int | None:
             plan = group_plan(members)
@@ -1317,7 +1412,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         by_class: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
             by_class.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
-        groups = [by_class[k] for k in sorted(by_class, reverse=True)]
+        groups = []
+        for k in sorted(by_class, reverse=True):
+            members = by_class[k]
+            if group_plan(members) is not None:
+                groups.append(members)
+                continue
+            # A class past one shared-slot call's chunks splits into calls that fit.
+            parts = bucketer.shared_slot_call_groups([decode_blocks[m] for m in members])
+            if parts is None:
+                return None
+            groups.extend([members[j] for j in part] for part in parts)
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1327,36 +1432,40 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunks(groups[i + 1]),
                     chunks(groups[i] + groups[i + 1]),
                 )
-                if ca is None or cb is None or cab is None:
+                if ca is None or cb is None:
                     return None
-                if cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
+                if cab is not None and cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
                     break
         if len(groups) == 1:
             return None
         out = []
+        rest = (
+            blocks_per_seq,
+            block_table,
+            query_start_loc,
+            active_block_indices,
+            attention_mask_stacks,
+        )
         for members in groups:
             members.sort()
-            b_seqs = bucketer.find_sequence_bucket(len(members))
             plan = group_plan(members)
-            assert b_seqs is not None and plan is not None
-            fields = self._batched_decode_tensors(
-                members,
-                b_seqs,
-                plan,
-                blocks_per_seq,
-                block_table,
-                query_start_loc,
-                active_block_indices,
-                attention_mask_stacks,
-            )
+            assert plan is not None
+            shared_slot_seqs = slot_onehot = None
+            if isinstance(plan, SharedSlotPlan):
+                shared_slot_seqs = bucketer.shared_slot_seqs
+                fields, slot_onehot = self._shared_slot_tensors(members, plan, *rest)
+            else:
+                fields = self._batched_decode_tensors(members, plan, *rest)
             out.append(
                 BatchedDecodeGroup(
                     len(members),
                     torch.tensor(members, dtype=torch.int32),
                     *fields,
                     chunk_range=plan.chunk_range,
+                    shared_slot_seqs=shared_slot_seqs,
+                    slot_onehot_cpu=slot_onehot,
                 )
             )
         return out
@@ -1402,7 +1511,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
         ``find_sequence_bucket`` and ``batched_decode_plan`` return the bucket's own
-        values and ``decode_uniformity`` is 1.
+        values and ``decode_uniformity`` is 1. For a shared-slot bucket that is
+        ``shared_slot_seqs`` sequences, which at its ``num_blocks`` need its chunk count.
         """
         num_seqs = bucket.num_seqs
         kv_len = bucket.num_blocks * self.block_size
@@ -1641,13 +1751,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     device_layout=layout,
                 ),
             )
-            # Each grouped dispatch writes its batch here before the scatter into
-            # out_staging; same shape and layout, so it matches the recorded variants.
-            if envs.SPYRE_JAGGED_DECODE:
-                self._group_staging = convert(
-                    torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
-                )
         return self._staging
+
+    def _group_staging_buffer(self, device: torch.device) -> torch.Tensor:
+        """Where each grouped dispatch writes its batch before the scatter into out_staging;
+        the staging buffers' shape and layout, so it matches the recorded variants."""
+        if self._group_staging is None:
+            shape = (self.staging_rows, self.num_heads, self.head_size)
+            self._group_staging = convert(
+                torch.zeros(shape, dtype=self.model_dtype),
+                device,
+                device_layout=row_outermost_layout(shape, self.model_dtype),
+            )
+        return self._group_staging
 
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
@@ -1672,6 +1788,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         # Loaded (or reloaded) weights replace the sink values; rebuild on next use.
         self._sinks_device = None
+
+    def _stage_query(self, query_dev: torch.Tensor) -> int:
+        """Copy ``query_dev`` into the query staging buffer; returns its row count."""
+        rows = query_dev.shape[0]
+        assert rows <= self.staging_rows, (
+            f"batch has {rows} rows, above max_num_batched_tokens={self.staging_rows}; "
+            "the staging buffers cannot hold it"
+        )
+        q_staging, _ = self._staging_buffers(query_dev.device)
+        q_staging[:rows] = query_dev
+        return rows
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
@@ -1774,9 +1901,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         first use.
         """
         num_pages = kv_cache[0].shape[0]
-        variants = builder.attn_bucketer.variants()
+        bucketer = builder.attn_bucketer
+        variants = bucketer.variants()
         decode_variants = (
-            builder.attn_bucketer.batched_decode_variants()
+            bucketer.shared_slot_variants() + bucketer.batched_decode_variants()
             if self._batched_decode_supported()
             else []
         )
@@ -1919,7 +2047,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"bucket {widest}; the recorded variants would not be the ones dispatch reaches"
         )
 
-        recorded: set[tuple[int, int, int, bool]] = set()
+        recorded: set[tuple[int, int, int, bool, bool]] = set()
         for i, bucket in enumerate(variants, start=1):
             t0 = time.time()
             try:
@@ -1944,15 +2072,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 realized,
                 time.time() - t0,
             )
-        if envs.SPYRE_JAGGED_DECODE:
+        if envs.SPYRE_JAGGED_DECODE or builder.attn_bucketer.splits_shared_slot_calls:
             self._record_group_scatter(sorted({v.num_seqs for v in variants}), kv_cache)
         return len(recorded)
 
     def _record_group_scatter(self, seq_buckets: list[int], kv_cache: SpyrePagedKVCache) -> None:
         device = kv_cache[0].device
         _, out_staging = self._staging_buffers(device)
-        group_out = self._group_staging
-        assert group_out is not None
+        group_out = self._group_staging_buffer(device)
         for b in seq_buckets:
             rows = convert(self._group_store_rows([], b), device=device)
             _scatter_rows_compiled(out_staging, rows, group_out)
@@ -1963,23 +2090,26 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         layer: AttentionLayer,
         kv_cache: SpyrePagedKVCache,
         builder: "SpyreAttentionMetadataBuilder",
-        recorded: "set[tuple[int, int, int, bool]]",
+        recorded: "set[tuple[int, int, int, bool, bool]]",
         num_pages: int,
-    ) -> "tuple[int, int, int, bool] | None":
+    ) -> "tuple[int, int, int, bool, bool] | None":
         """Trace the batched kernel ``bucket`` needs; None if already traced or unreachable.
 
-        Returns the ``(num_seqs, blocks_per_chunk, num_chunks, dynamic_chunks)`` key the
-        metadata ``build()`` produced actually dispatches on, not ``bucket``'s own.
+        Returns the ``(num_seqs, blocks_per_chunk, num_chunks, dynamic_chunks, shared_slots)``
+        key the metadata ``build()`` produced actually dispatches on, not ``bucket``'s own;
+        num_seqs is the output row count.
         """
         attn_metadata = builder.build_for_batched_decode_variant(bucket)
+        assert attn_metadata.batched_out_rows is not None
         assert attn_metadata.padded_num_seqs is not None
         assert attn_metadata.blocks_per_chunk is not None
         assert attn_metadata.chunk_page_ids_cpu is not None
         realized = (
-            attn_metadata.padded_num_seqs,
+            attn_metadata.batched_out_rows,
             attn_metadata.blocks_per_chunk,
             attn_metadata.chunk_page_ids_cpu.shape[0] // attn_metadata.blocks_per_chunk,
             attn_metadata.chunk_range is not None,
+            attn_metadata.shared_slot_seqs is not None,
         )
         # A sliding window realizes the pages its window touches, which can need fewer
         # chunks than requested. Without one build() lays the call out as the bucketer
@@ -1990,6 +2120,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             bucket.blocks_per_chunk,
             bucket.num_chunks,
             bucket.dynamic_chunks,
+            bucket.shared_slots,
         )
         if realized != requested and builder.sliding_window is None:
             logger.warning(
@@ -2156,14 +2287,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
+        out_rows = attn_metadata.batched_out_rows
         block_size = attn_metadata.block_size
 
-        assert b_seqs is not None and blocks_per_chunk is not None
+        assert b_seqs is not None and blocks_per_chunk is not None and out_rows is not None
         assert attn_metadata.rep_row_ids_dev is not None
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
-        # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
-        # b_seqs, not the real count -- into the staging buffers warmup recorded with.
+        assert (attn_metadata.shared_slot_seqs is None) == (attn_metadata.slot_onehot_dev is None)
+        # The kernel's store writes out[:out_rows] -- the seq bucket or the shared-slot rows,
+        # not the real count -- into the staging buffers warmup recorded with.
         q_staging, _ = self._staging_buffers(query_dev.device)
         assert query_dev is q_staging, "batched decode runs on the staging buffers only"
         assert output.shape == q_staging.shape and output.dtype == q_staging.dtype
@@ -2180,6 +2313,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             blocks_per_chunk,
             block_size,
             output,
+            attn_metadata.slot_onehot_dev,
         )
 
     def _grouped_decode_preconditions_met(
@@ -2202,8 +2336,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> None:
         assert attn_metadata.decode_groups is not None
         _, out_staging = self._staging_buffers(device)
-        group_out = self._group_staging
-        assert group_out is not None
+        group_out = self._group_staging_buffer(device)
         store = output if output is out_staging else out_staging
         for group in attn_metadata.decode_groups:
             if group.metadata is None:
@@ -2220,11 +2353,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     mask_by_chunk_cpu=group.mask_by_chunk_cpu,
                     mask_by_chunk_dev=None,
                     chunk_range=group.chunk_range,
+                    shared_slot_seqs=group.shared_slot_seqs,
+                    slot_onehot_cpu=group.slot_onehot_cpu,
+                    slot_onehot_dev=None,
                     decode_groups=None,
                 )
                 self._mirror_batched_decode_indices(group.metadata, device)
                 group.rows_dev = convert(
-                    self._group_store_rows(group.rows_cpu.tolist(), group.padded_num_seqs),
+                    self._group_store_rows(group.rows_cpu.tolist(), group.out_rows),
                     device=device,
                 )
             self._run_batched_decode_dispatch(
@@ -2250,6 +2386,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
         attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        if attn_metadata.shared_slot_seqs is not None:
+            assert attn_metadata.slot_onehot_cpu is not None
+            attn_metadata.slot_onehot_dev = convert(attn_metadata.slot_onehot_cpu, device=device)
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         b = attn_metadata.padded_num_seqs
@@ -2303,6 +2442,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        slot_onehot: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale, v_scale = self._read_scales()
         return _run_with_capped_cores(
@@ -2326,6 +2466,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out=out,
             v_scale=v_scale,
             sinks=self._device_sinks(query_dev.device),
+            slot_onehot=slot_onehot,
         )
 
     def build_index_tables(
@@ -2469,12 +2610,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         pre_staged = query_dev is q_staging
         batch_rows = self.staging_rows
         if not pre_staged:
-            batch_rows = query_dev.shape[0]
-            assert batch_rows <= self.staging_rows, (
-                f"batch has {batch_rows} rows, above max_num_batched_tokens="
-                f"{self.staging_rows}; the staging buffers cannot hold it"
-            )
-            q_staging[:batch_rows] = query_dev
+            batch_rows = self._stage_query(query_dev)
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False

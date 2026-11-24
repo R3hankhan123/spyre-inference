@@ -460,8 +460,26 @@ multiple of 8. Failed recordings are logged and compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants: per num-sequences bucket, one dynamic variant, recorded at the
 chunk count of `max_model_len`, that runs every batch, a single chunk included; variants
-that reach or exceed the allocated page count are skipped and declined at dispatch. A
-single step can carry a mix of prefill and decode sequences; each sequence is padded to
+that reach or exceed the allocated page count are skipped and declined at dispatch.
+
+With the shared-slot kernel, the num-sequences buckets up to `S = min(32, max_num_seqs)`
+record nothing of their own. A chunk has 32 *block slots*, one page each, and each block slot
+keeps its own running softmax across chunks. The per-bucket kernels give every sequence
+`32 / bucket` block slots. The shared-slot kernel lets the host share them out by length at
+every step instead: it picks the fewest chunks `C` that fit the batch and gives each sequence
+`ceil(blocks / C)` consecutive block slots. At chunk `c`, a sequence's block slot `k` reads
+its block `c * slots + k`. After the last chunk, a `[32, S]` one-hot sums each sequence's
+block slots into its output row, as the per-bucket kernel sums a sequence's block slots.
+Output rows past the batch copy row 0, so they stay finite.
+
+One dynamic variant serves every batch of up to `S` sequences, a single chunk included. It
+runs at most 32 chunks per call, or as many as one `max_model_len` sequence needs if that is
+more. This keeps its launches cheap, because every launch of a dynamic kernel prepares host
+data for every chunk in its range. A batch that needs more chunks runs as several grouped
+calls. Its range starts at one chunk (two with a layer of one KV head), and it is traced with
+`backed_size_oblivious` so that a single chunk does not get its own compiled kernel.
+
+A single step can carry a mix of prefill and decode sequences; each sequence is padded to
 its own query bucket (decodes use the length-1 bucket) before dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
@@ -538,15 +556,17 @@ calibrated one.
 
 Key constraints:
 
-- **KV length**: not bucketed. Each sequence walks its own page count, at least two
-  pages, within a page range declared up to `max_model_len` (or the pages a sliding window
+- **KV length**: not bucketed. Each sequence walks its own page count, from one page,
+  within a page range declared up to `max_model_len` (or the pages a sliding window
   touches), so one compiled kernel serves every length. One KV head on one page would leave
-  the decode kernel no spare dim for the stick, which the two-page minimum avoids
+  the decode kernel no spare dim for the stick, so a model with such a layer walks at least
+  two pages
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
-  each bucket's single-chunk and multi-chunk kernels are recorded during warmup
+  each bucket's dynamic kernel is recorded during warmup. With the shared-slot kernel,
+  only the buckets above 32 sequences are, since that kernel serves every batch of up to 32
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a
