@@ -468,9 +468,12 @@ keeps its own running softmax across chunks. The per-bucket kernels give every s
 `32 / bucket` block slots. The shared-slot kernel lets the host share them out by length at
 every step instead: it picks the fewest chunks `C` that fit the batch and gives each sequence
 `ceil(blocks / C)` consecutive block slots. At chunk `c`, a sequence's block slot `k` reads
-its block `c * slots + k`. After the last chunk, a `[32, S]` one-hot sums each sequence's
-block slots into its output row, as the per-bucket kernel sums a sequence's block slots.
-Output rows past the batch copy row 0, so they stay finite.
+its block `c * slots + k`. After the last chunk, an `[S, 32]` one-hot sums each sequence's
+block slots into its output row with a matmul batched over the KV heads and the queries per
+KV head, the two batch axes `lower_bmm` allows. Output rows past the batch copy row 0, so
+they stay finite. The merged rows come out of a permute, whose in-graph store into the
+row-outermost staging buffer misplaces rows, so the dispatch stores them with one compiled
+row scatter.
 
 One dynamic variant serves every batch of up to `S` sequences, a single chunk included. It
 runs at most 32 chunks per call, or as many as one `max_model_len` sequence needs if that is

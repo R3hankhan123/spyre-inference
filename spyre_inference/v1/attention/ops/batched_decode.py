@@ -26,9 +26,10 @@ slot 0 processes blocks 0, 2, 4, ... and slot 1 processes blocks 1, 3, 5, ... of
 sequence.
 Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
-In shared-slot mode the chunk's 32 block slots are not tied to a sequence: the host
-assigns each one to a sequence per step, and a ``[slots, rows]`` one-hot then merges each
-sequence's block slots into its output row, so no shape depends on the batch size.
+In shared-slot mode the chunk's block slots are not tied to a sequence: the host assigns
+each one to a sequence per step, and a ``[rows, slots]`` one-hot then merges each
+sequence's block slots into its output row with a matmul, so no shape depends on the
+batch size.
 """
 
 import torch
@@ -95,23 +96,48 @@ def _merge_entry_local(
     )
 
 
-def _merge_shared_slots(*, tile_max, tile_sum, tile_output, slot_onehot, sinks=None):
-    """Rescale each row's block slots to the row's maximum, sum them, then normalize once.
+# Score offset that takes a block slot out of a row's maximum: far below any real attention
+# score, yet finite in fp16 and bf16 even doubled. The merge's matmul sums every slot, so a
+# single non-finite one would turn every output row NaN (0 * inf); finfo limits leave no
+# headroom.
+SLOT_EXCLUDED_SCORE = 30000.0
 
-    ``slot_onehot`` [E, R, 1, 1, 1] marks the rows each block slot counts towards, so it is
-    ``_merge_entry_local`` with the ``(J, B)`` split replaced by a one-hot: every input
-    keeps the carry's rank and the sums run over dim 0. A row past the batch repeats row
-    0's slots, so all of a slot's rows share one maximum. An idle slot is in no row.
+
+def _merge_shared_slots(
+    *,
+    tile_max,
+    tile_sum,
+    tile_output,
+    slot_row_ids,
+    slot_onehot,
+    num_kv_heads,
+    num_queries_per_kv,
+    head_size,
+    sinks=None,
+):
+    """Merge each row's block slots into one output row, then normalize once.
+
+    ``slot_onehot`` [KV, Q, R, E] marks the block slots of each output row, repeated per head
+    so the sums are a matmul batched over (KV, Q), the two batch axes lower_bmm allows,
+    instead of a broadcast over the rows; ``slot_row_ids`` [E] is the row each slot's
+    maximum is read from. The heads stay split until the final reshape, as in
+    _merge_entry_local: torch-spyre cannot put a merged (KV, Q) axis on the stick. A row
+    past the batch repeats row 0's slots, and an idle slot is in no row and reads row 0.
+    Every exclusion uses SLOT_EXCLUDED_SCORE rather than a dtype limit.
     """
-    a = slot_onehot
-    neg = torch.finfo(tile_max.dtype).min
-    # Masked, not multiplied out: a slot outside a row must not lift its maximum.
-    row_max = torch.amax(a * tile_max + (1 - a) * neg, dim=0, keepdim=True)
-    slot_ref = torch.amax(a * row_max + (1 - a) * neg, dim=1, keepdim=True)
-    weight = torch.exp(-torch.relu(slot_ref - tile_max))
-    row_sum = torch.sum(a * (weight * tile_sum), dim=0)
-    row_out = torch.sum(a * (weight * tile_output), dim=0)
-    return normalize(row_max[0], row_sum, row_out, sinks)
+    num_out, entries = slot_onehot.shape[2:]
+    tm = tile_max.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    bias = ((slot_onehot[0, 0] - 1.0) * SLOT_EXCLUDED_SCORE).reshape(num_out, entries, 1, 1, 1)
+    row_max = torch.amax(tm.unsqueeze(0) + bias, dim=1)
+    weight = torch.exp(tm - row_max.index_select(0, slot_row_ids))
+    slot_sum = weight * tile_sum.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    slot_out = weight * tile_output.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    # [KV, Q, R, E] @ [KV, Q, E, x] -> [KV, Q, R, x] -> [R, KV, Q, x]
+    row_sum = torch.matmul(slot_onehot, slot_sum.permute(1, 2, 0, 3)).permute(2, 0, 1, 3)
+    row_out = torch.matmul(slot_onehot, slot_out.permute(1, 2, 0, 3)).permute(2, 0, 1, 3)
+    return normalize(row_max, row_sum, row_out, sinks).reshape(
+        num_out, num_kv_heads * num_queries_per_kv, head_size
+    )
 
 
 def batched_decode_kernel(
@@ -134,6 +160,7 @@ def batched_decode_kernel(
     v_scale=None,
     sinks=None,
     entry_local=None,
+    slot_row_ids=None,
     slot_onehot=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
@@ -153,8 +180,11 @@ def batched_decode_kernel(
     softmax state; None takes it past one chunk. A dynamic chunk count must set it, since
     branching on the count would be a guard.
 
-    Shared-slot mode: ``slot_onehot`` [E, R, 1, 1, 1] (see ``_merge_shared_slots``), with
-    num_seqs=1 and blocks_per_chunk=E. The output is [R, num_heads, head_size].
+    Shared-slot mode: ``slot_row_ids`` [E] and ``slot_onehot`` [KV, Q, R, E] (see
+    ``_merge_shared_slots``), with num_seqs=1 and blocks_per_chunk=E. The output is
+    [R, num_heads, head_size], and it is returned rather than stored: its rows come out of
+    a permute, whose in-graph store into the row-outermost staging buffer misplaces every
+    row past the first.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -260,16 +290,19 @@ def batched_decode_kernel(
         ),
     )
     tile_max, tile_sum, tile_output = carry
-    out_rows = num_seqs
     if slot_onehot is not None:
-        out_rows = slot_onehot.shape[1]
+        assert out is None, "the caller stores a shared-slot result"
         attn = _merge_shared_slots(
             tile_max=tile_max,
             tile_sum=tile_sum,
             tile_output=tile_output,
+            slot_row_ids=slot_row_ids,
             slot_onehot=slot_onehot,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            head_size=head_size,
             sinks=sinks,
-        ).reshape(out_rows, num_heads, head_size)
+        )
     elif use_entry_local:
         attn = _merge_entry_local(
             tile_max=tile_max,
@@ -290,6 +323,6 @@ def batched_decode_kernel(
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
-        out[:out_rows].copy_(attn)
+        out[:num_seqs].copy_(attn)
         return out
     return attn

@@ -23,6 +23,8 @@ from spyre_testing_plugin.attn_helpers import split_by_chunk, use_python_for_eac
 from spyre_inference.v1.attention.ops import batched_decode as bdhm
 
 BLOCK, HEAD, SCALE = 4, 8, 0.3
+# The block slots of one shared-slot chunk.
+SLOTS = 32
 
 
 def _inputs(b, bpc, c, kv):
@@ -325,7 +327,7 @@ def test_temp_split_layout_fields():
     assert list(layout.stride_map) == [8, 0, 1, 0]
 
 
-def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0):
+def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0, q=4):
     """Distinct pages per sequence and a part-filled last block, laid out by the builder.
 
     ``first_block_offset`` is added to sequence 0's block-0 scores through its mask.
@@ -349,7 +351,8 @@ def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0)
         block_size=BLOCK,
         model_dtype=torch.float32,
         num_kv_heads=kv,
-        _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows),
+        num_heads=kv * q,
+        _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows, shared_slots=SLOTS),
     )
     fields = SpyreAttentionMetadataBuilder._shared_slot_tensors(
         owner,
@@ -370,7 +373,7 @@ def _slot_pages(num_pages, kv):
 
 
 def _run_shared_slots(query, k_pages, v_pages, fields, kv, q, **kwargs):
-    (_, slots, _, rep, page_ids, mask), onehot = fields
+    (_, slots, _, rep, page_ids, mask), row_ids, onehot = fields
     page_ids, mask = split_by_chunk(page_ids, mask, slots)
     return bdhm.batched_decode_kernel(
         query=query,
@@ -386,6 +389,7 @@ def _run_shared_slots(query, k_pages, v_pages, fields, kv, q, **kwargs):
         num_queries_per_kv=q,
         block_size=BLOCK,
         head_size=HEAD,
+        slot_row_ids=row_ids,
         slot_onehot=onehot,
         **kwargs,
     )
@@ -484,17 +488,19 @@ def test_shared_slot_padding_rows_stay_finite_beside_a_dominant_slot():
     assert torch.equal(got[1:], got[:1].expand(3, -1, -1))
 
 
-def test_shared_slot_store_writes_its_rows_from_row_zero():
-    """``out`` takes exactly the slot rows, scaled by v_scale; rows past them are untouched."""
+def test_shared_slot_result_is_returned_scaled_and_never_stored():
+    """The result is scaled by v_scale and returned; the caller scatters it, since the merge's
+    permuted rows cannot be stored in-graph."""
     kv, q, blocks, rows = 2, 4, [40, 7], 4
     fields, _, _, num_pages = _shared_slot_case(blocks, rows, kv)
     k_pages, v_pages = _slot_pages(num_pages, kv)
     query = torch.randn(9, kv, q, HEAD)
-    out = torch.full((9, kv * q, HEAD), float("nan"))
     expected = _run_shared_slots(query, k_pages, v_pages, fields, kv, q) * 0.5
-    assert _run_shared_slots(query, k_pages, v_pages, fields, kv, q, out=out, v_scale=0.5) is out
-    torch.testing.assert_close(out[:rows], expected)
-    assert out[rows:].isnan().all()
+    got = _run_shared_slots(query, k_pages, v_pages, fields, kv, q, v_scale=0.5)
+    assert got.shape == (rows, kv * q, HEAD)
+    torch.testing.assert_close(got, expected)
+    with pytest.raises(AssertionError):
+        _run_shared_slots(query, k_pages, v_pages, fields, kv, q, out=torch.zeros(9, kv * q, HEAD))
 
 
 def test_shared_slots_match_the_per_bucket_kernel_on_a_uniform_batch():
@@ -502,7 +508,7 @@ def test_shared_slots_match_the_per_bucket_kernel_on_a_uniform_batch():
     B=4, J=8 split in another entry order."""
     kv, q, b, nb = 2, 4, 4, 16
     fields, block_table, stacks, num_pages = _shared_slot_case([nb] * b, b, kv)
-    assert fields[0][4].shape[0] == 2 * 32
+    assert fields[0][4].shape[0] == 2 * SLOTS
     k_pages, v_pages = _slot_pages(num_pages, kv)
     query = torch.randn(b, kv, q, HEAD)
     page_ids = block_table.t().contiguous()
@@ -527,9 +533,10 @@ def test_shared_slots_walk_the_active_blocks():
         block_size=BLOCK,
         model_dtype=torch.float32,
         num_kv_heads=1,
-        _attn_bucketer=SimpleNamespace(shared_slot_seqs=1),
+        num_heads=1,
+        _attn_bucketer=SimpleNamespace(shared_slot_seqs=1, shared_slots=SLOTS),
     )
-    (_, _, _, _, page_ids, mask), _ = SpyreAttentionMetadataBuilder._shared_slot_tensors(
+    (_, _, _, _, page_ids, mask), _, _ = SpyreAttentionMetadataBuilder._shared_slot_tensors(
         owner,
         [0],
         SharedSlotPlan(1, None, [4]),
@@ -541,4 +548,5 @@ def test_shared_slots_walk_the_active_blocks():
     )
     assert page_ids[:4, 0].tolist() == [16, 17, 18, 19]
     assert torch.equal(mask[:4, 0, 0, 0], tiles[:, 0])
-    assert mask[4:].isneginf().all()
+    # A spare slot's single chunk is excluded by a finite offset, not -inf.
+    assert (mask[4:] == -bdhm.SLOT_EXCLUDED_SCORE).all()

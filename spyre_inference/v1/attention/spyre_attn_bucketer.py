@@ -568,6 +568,11 @@ class SpyreAttnBucketer:
         return BatchedDecodePlan(static * width, width, static, None)
 
     @property
+    def shared_slots(self) -> int:
+        """The block slots of one shared-slot chunk."""
+        return _SPYRE_CORE_COUNT
+
+    @property
     def shared_slot_seqs(self) -> int | None:
         """The most decode sequences one shared-slot call serves, None without the kernel."""
         return None if self._shared_slot_chunk_range is None else self._shared_slot_seqs
