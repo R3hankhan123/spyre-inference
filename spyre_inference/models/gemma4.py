@@ -24,7 +24,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from vllm.distributed import GroupCoordinator, get_tp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.gemma4 import (
     Gemma4ForCausalLM,
     Gemma4Router,
@@ -40,7 +46,9 @@ from vllm.v1.kv_cache_interface import (
     replace_as,
 )
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._prelaunch import disable_modalities
 from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
@@ -48,7 +56,6 @@ from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from torch import nn
     from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
@@ -203,11 +210,176 @@ class _PerLayerRows(torch.Tensor):
         return torch.Tensor.__getitem__(self, index)
 
 
+class _HostResident:
+    """Keeps a module's tensors in host memory when the model moves to Spyre."""
+
+    def _apply(self, fn, recurse=True):
+        return self
+
+
+def _skip_weight(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    pass
+
+
+class _HostPerLayerTable(_HostResident, nn.Module):
+    """Gemma 4's per-layer table, whole, in the host memory of the rank that looks it up.
+
+    Replaces the vocab-sharded embedding. Every other rank keeps an empty weight and
+    skips the checkpoint tensor.
+    """
+
+    def __init__(self, num_embeddings: int, dim: int, dtype: torch.dtype, *, load: bool):
+        super().__init__()
+        rows = num_embeddings if load else 0
+        self.weight = nn.Parameter(torch.empty(rows, dim, dtype=dtype, device="cpu"), False)
+        self.weight.weight_loader = default_weight_loader if load else _skip_weight  # ty: ignore[unresolved-attribute]
+
+
+def _ple_fits_nnpa(vllm_config: VllmConfig, decoder: Gemma4SelfDecoderLayers) -> bool:
+    """Whether this host can take the per-layer inputs off the card (s390x with NNPA)."""
+    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
+    from spyre_inference.nnpa import nnpa_max_dim
+
+    max_dim = nnpa_max_dim()
+    if not max_dim:
+        return False
+    projection = decoder.per_layer_model_projection
+    return (
+        # The streaming loader writes the weights straight to the card.
+        vllm_config.load_config.load_format != "spyre"
+        # Host ops cannot be traced into a whole-model graph.
+        and envs.SPYRE_COMPILE_GRANULARITY != "model"
+        and type(projection.quant_method) is SpyreUnquantizedLinearMethod
+        and max(projection.input_size, projection.output_size) <= max_dim
+    )
+
+
+def _rebuild_ple_for_host(
+    model: nn.Module, decoder: Gemma4SelfDecoderLayers, vllm_config: VllmConfig
+) -> None:
+    """Swap the TP-sharded table and projection for whole ones before loading.
+
+    TP rank 0 alone holds the table and looks it up. The projection is small, so every
+    rank loads it whole; only rank 0 runs it.
+    """
+    tp = get_tp_group()
+    modules: dict[str, nn.Module] = {
+        "embed_tokens_per_layer": _HostPerLayerTable(
+            decoder.vocab_size_per_layer_input,
+            decoder.config.num_hidden_layers * decoder.hidden_size_per_layer_input,
+            vllm_config.model_config.dtype,
+            load=tp.rank_in_group == 0,
+        )
+    }
+    if tp.world_size > 1:
+        projection = decoder.per_layer_model_projection
+        modules["per_layer_model_projection"] = ColumnParallelLinear(
+            projection.input_size,
+            projection.output_size,
+            bias=False,
+            gather_output=True,
+            return_bias=False,
+            quant_config=projection.quant_config,
+            prefix=projection.prefix,
+            disable_tp=True,
+        )
+    # Gemma4Model owns the modules (and loads them); the decoder shares them.
+    for name, module in modules.items():
+        setattr(model, name, module)
+        setattr(decoder, name, module)
+
+
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
-    @maybe_compile(force=True)
+    ple_on_nnpa: bool = False
+    """Per-layer inputs off the card (``place_ple_on_nnpa``)."""
+
+    def place_ple_on_nnpa(self, tp_group: GroupCoordinator | None = None) -> None:
+        """Look up the per-layer table on the host and project on NNPA.
+
+        The table stays in host memory, so the card holds none of it, and the only
+        transfers are the token ids and input embeddings down and the result up. Under
+        TP the group's first rank computes the result and broadcasts it on the host.
+        """
+        for module in (
+            self.embed_tokens_per_layer,
+            self.per_layer_model_projection,
+            self.per_layer_projection_norm,
+        ):
+            if not isinstance(module, _HostResident):
+                base = type(module)
+                module.__class__ = type(f"Host{base.__name__}", (_HostResident, base), {})
+        # Read while the buffers are still on the host.
+        self.ple_embed_scale = float(self.embed_scale_per_layer)
+        self.ple_input_scale = float(self.per_layer_input_scale)
+        self.ple_projection_scale = float(self.per_layer_projection_scale)
+        self.ple_group = tp_group
+        self.ple_source = tp_group is None or tp_group.rank_in_group == 0
+        self.nnpa_projection = None
+        self.ple_on_nnpa = True
+        logger.info("Spyre: Gemma-4 per-layer inputs run on the host and NNPA.")
+
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        if self.ple_on_nnpa:
+            if not self.ple_source:
+                return None
+            return self._host_per_layer_inputs(convert(input_ids, device="cpu"))
+        return self._spyre_per_layer_inputs(input_ids)
+
+    @maybe_compile(force=True)
+    def _spyre_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         # The upstream mask needs a compiled region even outside decoder blocks.
         return super().get_per_layer_inputs(input_ids)
+
+    def _host_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Upstream's masked lookup, on the host-resident table. Unscaled: the NNPA
+        projection applies the embed scale in its combine pass."""
+        ids = input_ids.long()
+        ids = ids.masked_fill((ids < 0) | (ids >= self.vocab_size_per_layer_input), 0)
+        table = cast(torch.Tensor, self.embed_tokens_per_layer.weight)
+        embeds = F.embedding(ids, table)
+        return embeds.reshape(
+            *input_ids.shape, self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
+
+    def _nnpa_project(
+        self, inputs_embeds: torch.Tensor, per_layer_inputs: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Upstream's projection, norm and combine: the matmul on NNPA, the rest in one fp32
+        host pass."""
+        shape = (
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        if self.ple_source:
+            ple = self._nnpa_project_here(inputs_embeds, per_layer_inputs).reshape(shape)
+        else:
+            ple = torch.empty(shape, dtype=inputs_embeds.dtype)
+        if self.ple_group is not None:
+            group = self.ple_group
+            dist.broadcast(ple, src=group.first_rank, group=group.cpu_group)
+        return convert(ple, device=inputs_embeds.device)
+
+    def _nnpa_project_here(
+        self, inputs_embeds: torch.Tensor, per_layer_inputs: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.nnpa_projection is None:
+            # SpyreUnquantizedLinearMethod already stored Wᵀ, [in, out], on the host.
+            weight_t = cast(torch.Tensor, self.per_layer_model_projection.weight).float()
+            norm = self.per_layer_projection_norm
+            self.nnpa_projection = torch.classes._spyre_C.NnpaPerLayerProjection(  # ty: ignore[unresolved-attribute]
+                (weight_t * self.ple_projection_scale).half(),
+                norm.weight,
+                norm.variance_epsilon,
+                self.ple_embed_scale,
+                self.ple_input_scale,
+            )
+        hidden = convert(inputs_embeds, device="cpu")
+        hidden = hidden.reshape(-1, hidden.shape[-1])
+        rows = None if per_layer_inputs is None else per_layer_inputs.reshape(hidden.shape[0], -1)
+        return torch.ops._spyre_C.nnpa_per_layer_project(  # ty: ignore[unresolved-attribute]
+            self.nnpa_projection, hidden, rows
+        )
 
     @maybe_compile
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -215,7 +387,12 @@ class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
         return tuple(ple[:, i, :].clone() for i in range(self.config.num_hidden_layers))
 
     def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs):
-        ple = cast(torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs))
+        if self.ple_on_nnpa:
+            ple = self._nnpa_project(inputs_embeds, per_layer_inputs)
+        else:
+            ple = cast(
+                torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+            )
         rows = ple.as_subclass(_PerLayerRows)
         rows.spyre_rows = self.split_per_layer_inputs(ple)
         return rows
@@ -247,7 +424,12 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         decoder = self.model.self_decoder
         if decoder.embed_tokens_per_layer is not None:
-            retype(decoder, SpyreGemma4SelfDecoderLayers).arm_outer_compile()
+            decoder = retype(decoder, SpyreGemma4SelfDecoderLayers)
+            decoder.arm_outer_compile()
+            if _ple_fits_nnpa(vllm_config, decoder):
+                _rebuild_ple_for_host(self.model, decoder, vllm_config)
+                tp = get_tp_group()
+                decoder.place_ple_on_nnpa(tp if tp.world_size > 1 else None)
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
         # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
         is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(

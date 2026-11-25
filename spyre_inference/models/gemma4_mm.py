@@ -425,9 +425,11 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # Upstream allocates the PLE cache (E2B/E4B) on the host as a plain attribute, which
-        # does not follow the model to Spyre; a buffer does.
+        # does not follow the model to Spyre; a buffer does. On NNPA it stays on the host,
+        # where the lookup writes it and the projection reads it.
         ple = getattr(self, "per_layer_embeddings", None)
-        if ple is not None:
+        decoder = self.language_model.model.self_decoder
+        if ple is not None and not getattr(decoder, "ple_on_nnpa", False):
             del self.per_layer_embeddings
             self.register_buffer("per_layer_embeddings", ple, persistent=False)
         self._init_spyre_vision()

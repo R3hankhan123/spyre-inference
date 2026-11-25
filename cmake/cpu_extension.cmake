@@ -100,6 +100,17 @@ if (POWER10_FOUND OR POWER11_FOUND)
   list(APPEND CXX_COMPILE_FLAGS "-mvsx" "-mcpu=power10" "-mtune=power10")
 elseif (S390_FOUND)
   list(APPEND CXX_COMPILE_FLAGS "-mvx" "-mzvector" "-march=z15" "-mtune=z15")
+  # NNPA (z16+) offload. Only the header is needed to build: libzdnn is dlopen'ed at
+  # runtime, so the z15 baseline stays and _C imports on a host without it.
+  find_path(ZDNN_INCLUDE_DIR zdnn.h)
+  if (ZDNN_INCLUDE_DIR)
+    list(APPEND SPYRE_EXT_SRC "csrc/cpu/nnpa_kernels.cpp")
+    include_directories(${ZDNN_INCLUDE_DIR})
+    list(APPEND SPYRE_EXT_LIBS ${CMAKE_DL_LIBS})
+  else()
+    message(STATUS "zdnn.h not found: building without NNPA offload. "
+                   "Pass -DZDNN_INCLUDE_DIR=<dir> through CMAKE_ARGS to enable it.")
+  endif()
 else()
   message(FATAL_ERROR "spyre-inference CPU kernels require x86_64, Power10+ or s390x.")
 endif()
@@ -108,5 +119,5 @@ define_extension_target(
   _C
   DESTINATION spyre_inference
   SOURCES ${SPYRE_EXT_SRC}
-  LIBRARIES ${OPEN_MP}
+  LIBRARIES ${OPEN_MP} ${SPYRE_EXT_LIBS}
   COMPILE_FLAGS ${CXX_COMPILE_FLAGS})

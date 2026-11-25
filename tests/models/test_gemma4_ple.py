@@ -17,9 +17,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import CompilationMode
 from vllm.model_executor.models import gemma4 as upstream
 
+from spyre_inference import nnpa
 from spyre_inference.custom_ops import lazy_compile
 from spyre_inference.models import gemma4
 from spyre_inference.models.gemma4 import _PerLayerRows
@@ -82,6 +84,8 @@ def _build(monkeypatch, *, per_layer_vocab: int, vocab: int = 16, ple: bool = Tr
     monkeypatch.setattr(
         lazy_compile, "get_cached_compilation_config", lambda: SimpleNamespace(mode=None)
     )
+    # These cover the retype; the NNPA gate needs a real config.
+    monkeypatch.setattr(nnpa, "nnpa_max_dim", lambda: 0)
     return gemma4.SpyreGemma4ForCausalLM(vllm_config=None)
 
 
@@ -210,3 +214,120 @@ def test_enclosing_graph_absorbs_lookup_and_split(ple_decoder):
     assert not decoder.spyre_compiled_kernels
     for i, row in enumerate(rows):
         torch.testing.assert_close(row.cpu(), expected[:, i, :], atol=0, rtol=0)
+
+
+class _RMSNorm(nn.Module):
+    def __init__(self, weight: torch.Tensor, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        return F.rms_norm(x, x.shape[-1:], self.weight, self.variance_epsilon)
+
+
+def _ple_decoder(cls, *, table, projection, norm_weight, num_layers, width, vocab):
+    decoder = cls.__new__(cls)
+    nn.Module.__init__(decoder)
+    decoder.config = SimpleNamespace(num_hidden_layers=num_layers)
+    decoder.hidden_size_per_layer_input = width
+    decoder.vocab_size_per_layer_input = vocab
+    decoder.embed_tokens_per_layer = nn.Embedding.from_pretrained(table)
+    linear = nn.Linear(projection.shape[1], projection.shape[0], bias=False)
+    linear.weight = nn.Parameter(projection, requires_grad=False)
+    decoder.per_layer_model_projection = linear
+    decoder.per_layer_projection_norm = _RMSNorm(norm_weight, eps=1e-6)
+    decoder.register_buffer("embed_scale_per_layer", torch.tensor(width**0.5))
+    decoder.register_buffer("per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)))
+    decoder.register_buffer("per_layer_projection_scale", torch.tensor(projection.shape[1] ** -0.5))
+    return decoder
+
+
+@pytest.mark.skipif(nnpa.nnpa_max_dim() == 0, reason="needs NNPA (z16+) and libzdnn")
+@pytest.mark.parametrize("with_rows", [True, False])
+def test_host_per_layer_inputs_match_upstream(monkeypatch, with_rows):
+    """The host lookup and the NNPA projection, norm and combine against upstream's own
+    methods."""
+    monkeypatch.setattr(
+        lazy_compile, "get_cached_compilation_config", lambda: SimpleNamespace(mode=None)
+    )
+    num_layers, width, hidden, vocab = 3, 64, 128, 40
+    g = torch.Generator().manual_seed(0)
+    table = torch.randn(vocab + 8, num_layers * width, generator=g)
+    projection = torch.randn(num_layers * width, hidden, generator=g) * 0.1
+    norm_weight = torch.rand(width, generator=g) + 0.5
+    embeds = torch.randn(7, hidden, generator=g)
+    # Out-of-range ids take row zero, as upstream masks them.
+    ids = torch.tensor([3, -1, 0, vocab - 1, vocab, vocab + 5, 17])
+    shape = dict(num_layers=num_layers, width=width, vocab=vocab)
+
+    reference = _ple_decoder(
+        upstream.Gemma4SelfDecoderLayers,
+        table=table,
+        projection=projection,
+        norm_weight=norm_weight,
+        **shape,
+    )
+    expected = reference.project_per_layer_inputs(
+        embeds, reference.get_per_layer_inputs(ids) if with_rows else None
+    )
+
+    decoder = _ple_decoder(
+        gemma4.SpyreGemma4SelfDecoderLayers,
+        table=table.half(),
+        projection=projection.half(),
+        norm_weight=norm_weight.half(),
+        **shape,
+    )
+    decoder.per_layer_model_projection = _LinearT(projection.t().half().contiguous())
+    decoder.arm_outer_compile()
+    decoder.place_ple_on_nnpa()
+    actual = decoder._nnpa_project(
+        embeds.half(), decoder.get_per_layer_inputs(ids) if with_rows else None
+    )
+
+    assert actual.dtype == torch.float16
+    # DLFloat16 keeps a 9-bit mantissa; the accumulation stays wide.
+    torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=3e-2)
+
+
+def test_nnpa_tables_stay_on_the_host(monkeypatch):
+    monkeypatch.setattr(
+        lazy_compile, "get_cached_compilation_config", lambda: SimpleNamespace(mode=None)
+    )
+    decoder = _ple_decoder(
+        gemma4.SpyreGemma4SelfDecoderLayers,
+        table=torch.zeros(8, 6),
+        projection=torch.zeros(6, 4),
+        norm_weight=torch.ones(2),
+        num_layers=3,
+        width=2,
+        vocab=8,
+    )
+    decoder.arm_outer_compile()
+    decoder.place_ple_on_nnpa()
+
+    decoder.to("meta")
+
+    assert decoder.embed_scale_per_layer.is_meta
+    for module in (
+        decoder.embed_tokens_per_layer,
+        decoder.per_layer_model_projection,
+        decoder.per_layer_projection_norm,
+    ):
+        assert all(p.device.type == "cpu" for p in module.parameters())
+
+
+@pytest.mark.parametrize("load", [True, False])
+def test_host_table_loads_only_on_the_looking_up_rank(load):
+    table = gemma4._HostPerLayerTable(8, 6, torch.float16, load=load)
+    checkpoint = torch.arange(48, dtype=torch.float16).reshape(8, 6)
+
+    table.weight.weight_loader(table.weight, checkpoint)
+    table.to("meta")
+
+    assert table.weight.device.type == "cpu"
+    if load:
+        torch.testing.assert_close(table.weight.data, checkpoint, atol=0, rtol=0)
+    else:
+        assert table.weight.numel() == 0
