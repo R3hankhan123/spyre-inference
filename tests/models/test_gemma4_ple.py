@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.config import CompilationMode
 from vllm.model_executor.models import gemma4 as upstream
 
@@ -223,7 +222,19 @@ class _RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x):
-        return F.rms_norm(x, x.shape[-1:], self.weight, self.variance_epsilon)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.variance_epsilon) * self.weight
+
+
+class _LinearT(nn.Module):
+    """Spyre's linear form: a stored ``Wᵀ``, ``[in, out]``, and a plain matmul."""
+
+    def __init__(self, weight_t: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight_t, requires_grad=False)
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight)
 
 
 def _ple_decoder(cls, *, table, projection, norm_weight, num_layers, width, vocab):
@@ -331,3 +342,56 @@ def test_host_table_loads_only_on_the_looking_up_rank(load):
         torch.testing.assert_close(table.weight.data, checkpoint, atol=0, rtol=0)
     else:
         assert table.weight.numel() == 0
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+def test_card_projection_is_one_graph_matching_upstream(monkeypatch, num_tokens):
+    """The card path's projection, scale, norm and combine run as one compiled graph
+    (eagerly, the projection's TP all-gather takes the slow list-form path) and match
+    upstream's computation."""
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+
+    if not spyre_available():
+        pytest.skip("Spyre hardware is required")
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    num_layers, width, hidden, vocab = 3, 256, 512, 40
+    g = torch.Generator().manual_seed(0)
+    table = torch.zeros(vocab, num_layers * width)
+    projection = torch.randn(num_layers * width, hidden, generator=g) * 0.05
+    norm_weight = torch.rand(width, generator=g) + 0.5
+    embeds = torch.randn(num_tokens, hidden, generator=g)
+    lookups = torch.randn(num_tokens, num_layers, width, generator=g)
+    shape = dict(num_layers=num_layers, width=width, vocab=vocab)
+
+    reference = _ple_decoder(
+        upstream.Gemma4SelfDecoderLayers,
+        table=table,
+        projection=projection,
+        norm_weight=norm_weight,
+        **shape,
+    )
+    expected = reference.project_per_layer_inputs(embeds, lookups)
+
+    decoder = _ple_decoder(
+        gemma4.SpyreGemma4SelfDecoderLayers,
+        table=table,
+        projection=projection,
+        norm_weight=norm_weight,
+        **shape,
+    )
+    decoder.per_layer_model_projection = _LinearT(projection.t().contiguous())
+    decoder.arm_outer_compile()
+    decoder.to("spyre", torch.float16)
+    with torch.inference_mode():
+        rows = decoder.project_per_layer_inputs(
+            embeds.half().to("spyre"), lookups.half().to("spyre")
+        )
+
+    names = {kernel.__name__ for kernel in decoder.spyre_compiled_kernels}
+    assert "_spyre_project_per_layer_inputs" in names
+    for i, row in enumerate(rows.spyre_rows):
+        torch.testing.assert_close(row.cpu().float(), expected[:, i, :], atol=3e-2, rtol=3e-2)
